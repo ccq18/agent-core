@@ -18,7 +18,7 @@ it('uses Plan permission rules for each tool even when read and write share an a
   let step = 0;
   const core = runtime(dir, (model, context) => {
     expect(getCurrentTools(context.messages).map(({ name }) => name))
-      .toEqual(['todowrite', 'todoread', 'load_skill', 'subagent', 'read']);
+      .toEqual(['todowrite', 'todoread', 'load_skill', 'subagent', 'question', 'read']);
     switch (step++) {
       case 0:
         return reply(model, call('write'), call('read'), call('todowrite', { items }));
@@ -57,7 +57,7 @@ it('uses Plan permission rules for each tool even when read and write share an a
   expect((await fresh.openSession(session.id)).getPlan()).toEqual(items);
 });
 
-it('appends mode reminders while keeping the leading system message equal across switches and branches', async () => {
+it('inserts mode reminders before the latest user message while keeping the leading system message equal across switches and branches', async () => {
   const contexts: TranscriptContext[] = [];
   const storage = new JsonlTreeSessionStore(dir);
   const core = runtime(dir, (model, context) => {
@@ -78,7 +78,7 @@ it('appends mode reminders while keeping the leading system message equal across
   await session.branch(leaf.id);
   await session.prompt('Build branch');
 
-  const updates = contexts.slice(1).map(({ messages }) => messages.at(-1));
+  const updates = contexts.slice(1).map(({ messages }) => messages.at(-2));
   expect(updates).toMatchObject([
     { role: 'user', content: expect.stringMatching(/<system-update>.*plan/is) },
     { role: 'user', content: expect.stringMatching(/<system-update>.*build/is) },
@@ -166,7 +166,7 @@ it('rebuilds the Build reminder after reopening a compacted transcript', async (
   expect(contexts[1].messages).toEqual(expect.arrayContaining([
     expect.objectContaining({ role: 'user', content: expect.stringContaining('<compaction-summary>') }),
   ]));
-  expect(contexts[1].messages.at(-1)).toMatchObject({
+  expect(contexts[1].messages.at(-2)).toMatchObject({
     role: 'user', content: expect.stringMatching(/<system-update>.*build/is),
   });
 });

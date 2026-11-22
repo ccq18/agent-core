@@ -5,6 +5,7 @@ import type { AgentCoreEventData, TurnState } from '../types/events.js';
 import type { PermissionRule } from '../types/permission.js';
 import type { AgentMode, SessionStorageAdapter } from '../types/session.js';
 import type { CoreToolDefinition, ToolExecutionContext } from '../types/tool.js';
+import { DEFAULT_PROMPT_TEMPLATES } from './prompt.js';
 
 const DEFAULT_PROFILES: Record<string, SubagentProfile> = {
   explore: {
@@ -61,6 +62,7 @@ export class SubagentManager {
     private readonly sessions: SubagentSessions,
     profiles: Record<string, Partial<SubagentProfile>> = {},
     maxDepth = 1,
+    description = DEFAULT_PROMPT_TEMPLATES.subagentDescription,
   ) {
     const configured = new Map(Object.entries(DEFAULT_PROFILES));
     for (const [key, profile] of Object.entries(profiles)) {
@@ -70,6 +72,7 @@ export class SubagentManager {
     }
     this.profiles = configured;
     this.maxDepth = maxDepth;
+    this.tool.description = description;
   }
 
   getProfile(name: string): SubagentProfile | undefined {
@@ -92,7 +95,7 @@ export class SubagentManager {
   readonly tool: CoreToolDefinition = {
     name: 'subagent',
     label: 'Delegate subagent',
-    description: 'Delegate an isolated task to a subagent. Built-in profiles: explore (read-only investigation) and general (task execution).',
+    description: DEFAULT_PROMPT_TEMPLATES.subagentDescription,
     permissionAction: 'subagent',
     resolveResources: (params) => [String(params.agent)],
     readOnly: true,

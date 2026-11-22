@@ -1,19 +1,20 @@
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
+import type { PromptTemplates } from '../types/config.js';
 import type { PermissionRule } from '../types/permission.js';
 import type { AgentMode } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
+import { DEFAULT_PROMPT_TEMPLATES, wrapSystemUpdate } from './prompt.js';
 
 const PLAN_READ: readonly PermissionRule[] = [{ action: '*', resource: '*', effect: 'allow' }];
 const PLAN_WRITE: readonly PermissionRule[] = [{ action: '*', resource: '*', effect: 'deny' }];
-const modeUpdates: Record<AgentMode, string> = {
-  plan: '<system-update>\nPlan mode is active. Inspect facts and make a plan without modifying files or performing side effects. Use todowrite to maintain the plan.\n</system-update>',
-  build: '<system-update>\nBuild mode is active. You can proceed with the plan using the available tools.\n</system-update>',
-};
-
 export class ModeController {
   private shouldRemind: boolean;
 
-  constructor(private currentMode: AgentMode, changed = false) {
+  constructor(
+    private currentMode: AgentMode,
+    changed = false,
+    private readonly prompts: Pick<PromptTemplates, 'planModeEnter' | 'buildModeEnter'> = DEFAULT_PROMPT_TEMPLATES,
+  ) {
     this.shouldRemind = changed || currentMode === 'plan';
   }
 
@@ -37,9 +38,16 @@ export class ModeController {
 
   transformContext(messages: AgentMessage[]): AgentMessage[] {
     if (!this.shouldRemind) return messages;
-    const content = modeUpdates[this.mode];
+    const template = this.mode === 'plan' ? this.prompts.planModeEnter : this.prompts.buildModeEnter;
+    if (!template.trim()) return messages;
+    const content = wrapSystemUpdate(template);
     const tail = messages.at(-1);
     if (tail?.role === 'user' && tail.content === content) return messages;
-    return [...messages, { role: 'user', content, timestamp: Date.now() }];
+    const index = tail?.role === 'user' ? messages.length - 1 : messages.length;
+    const preceding = messages[index - 1];
+    if (preceding?.role === 'user' && preceding.content === content) return messages;
+    const updated = messages.slice();
+    updated.splice(index, 0, { role: 'user', content, timestamp: Date.now() });
+    return updated;
   }
 }

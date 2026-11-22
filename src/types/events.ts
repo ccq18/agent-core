@@ -1,4 +1,5 @@
 import type { ApprovalDecision, ApprovalRequest } from './permission.js';
+import type { PendingQuestionRequest, QuestionAnswer } from './question.js';
 import type { AgentMode, PlanItem } from './session.js';
 
 export interface TokenUsage {
@@ -44,6 +45,8 @@ export type AgentCoreEventData =
   | { type: 'tool_end'; toolCallId: string; toolName: string; isError: boolean; summary: string; truncated?: boolean; outputPath?: string; durationMs?: number }
   | { type: 'approval_requested'; request: ApprovalRequest }
   | { type: 'approval_resolved'; requestId: string; decision: ApprovalDecision }
+  | { type: 'question_requested'; request: PendingQuestionRequest }
+  | { type: 'question_resolved'; requestId: string; cancelled: boolean; answers?: QuestionAnswer }
   | { type: 'subagent_started'; subagentId: string; profile: string; description: string; background: boolean }
   | { type: 'subagent_completed'; subagentId: string; state: TurnState; summary: string }
   | { type: 'compaction_start'; trigger: 'auto' | 'overflow' | 'manual'; tokensBefore: number }

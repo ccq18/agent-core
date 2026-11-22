@@ -4,14 +4,18 @@ import { createInitialSystemMessage, getCurrentTools, getToolStateChanges, toToo
 import { ModeController } from '../harness/mode.js';
 import { PermissionEngine, type PermissionRulesets } from '../harness/permission.js';
 import { PlanStore } from '../harness/plan.js';
+import { DEFAULT_PROMPT_TEMPLATES, wrapSystemUpdate } from '../harness/prompt.js';
+import type { QuestionManager } from '../harness/question.js';
+import { isRuleUpdateMessage, RulesLoader, type RuleUpdateMessage } from '../harness/rules.js';
 import type { SubagentManager, SubagentParent } from '../harness/subagent.js';
 import { ToolRegistry } from '../harness/tool-registry.js';
 import type { OutputTruncator } from '../harness/truncation.js';
 import type { ModelRouter } from '../model/router.js';
 import { CompactionEngine, estimateContextTokens, type CompactionTrigger } from '../session/compaction.js';
-import type { AgentRuntimeHooks, PromptOptions, SubagentProfile } from '../types/config.js';
+import type { AgentRuntimeHooks, PromptOptions, PromptTemplates, SubagentProfile } from '../types/config.js';
 import type { AgentCoreEvent, AgentCoreEventData, TurnSummary } from '../types/events.js';
 import type { ApprovalDecision, ApprovalRequest, PendingApprovalRequest, PermissionRule } from '../types/permission.js';
+import type { PendingQuestionRequest, QuestionAnswer } from '../types/question.js';
 import type { AgentMode, CompactionResult, PlanItem, SessionProjection, SessionStorageAdapter } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
 import { EventMapper, sumTokenUsage } from './event-mapper.js';
@@ -28,6 +32,9 @@ export interface AgentSessionHandle {
   getPlan(): PlanItem[];
   getPendingApprovals(): ApprovalRequest[];
   replyApproval(requestId: string, decision: ApprovalDecision): void;
+  getPendingQuestions(): PendingQuestionRequest[];
+  replyQuestion(requestId: string, answers: QuestionAnswer | { cancelled: true }): void;
+  injectRulesForPath(targetPath: string): string[];
   compact(customInstructions?: string): Promise<CompactionResult>;
   close(): Promise<void>;
   subscribe(listener: (event: AgentCoreEvent) => void): () => void;
@@ -51,6 +58,10 @@ interface SessionHandleOptions {
   cwd?: string;
   systemPrompt?: string;
   hooks?: AgentRuntimeHooks;
+  prompts?: PromptTemplates;
+  questions?: QuestionManager;
+  rulesLoader?: RulesLoader;
+  baselineRulePaths?: ReadonlySet<string>;
   onClose?(): void;
 }
 
@@ -68,7 +79,7 @@ interface ActiveRun {
 
 type EventListener = (event: AgentCoreEvent) => void;
 const OVERFLOW = /context length|maximum context|too many tokens|context_length_exceeded|prompt is too long/i;
-const SUBAGENT_FINAL = '<system-update>Tool steps are exhausted. Return your final summary now using the information already gathered.</system-update>';
+const PATH_FIELDS = ['path', 'filePath', 'file_path', 'cwd', 'directory'] as const;
 
 export class SessionHandle implements AgentSessionHandle {
   readonly id: string;
@@ -81,6 +92,9 @@ export class SessionHandle implements AgentSessionHandle {
   private readonly permissions: PermissionEngine;
   private readonly permissionRules: PermissionRulesets;
   private readonly compaction: CompactionEngine;
+  private readonly rulesLoader: RulesLoader;
+  private readonly pendingRules: Array<{ path: string; rule: string }> = [];
+  private loadedRulePaths = new Set<string>();
   private toolDefinitions: ReadonlyMap<string, CoreToolDefinition> = new Map();
   private modelAlias?: string;
   private savedMessageCount: number;
@@ -94,10 +108,13 @@ export class SessionHandle implements AgentSessionHandle {
 
   constructor(private readonly options: SessionHandleOptions, projection: SessionProjection) {
     this.id = options.id;
-    this.modeController = new ModeController(projection.mode, projection.modeChanged);
+    const prompts = options.prompts ?? DEFAULT_PROMPT_TEMPLATES;
+    this.modeController = new ModeController(projection.mode, projection.modeChanged, prompts);
     this.permissions = options.permissionEngine ?? new PermissionEngine();
     this.permissionRules = [options.globalPermissions ?? [], options.sessionPermissions ?? []];
-    this.compaction = options.compaction ?? new CompactionEngine(options.storage, options.router);
+    this.compaction = options.compaction ?? new CompactionEngine(options.storage, options.router, {}, prompts);
+    this.rulesLoader = options.rulesLoader ?? new RulesLoader();
+    this.restoreRulePaths(projection.messages);
     this.modelAlias = projection.modelAlias;
     this.mapper = new EventMapper(this.id);
     this.planStore = new PlanStore(this.id, options.storage, projection.plan, (items, runId) => {
@@ -114,7 +131,8 @@ export class SessionHandle implements AgentSessionHandle {
         systemPrompt: options.systemPrompt,
       },
       transformContext: async (messages, signal) => {
-        const transformed = this.modeController.transformContext(await hooks?.transformContext?.(messages, signal) ?? messages);
+        const withRules = this.transformRuleContext(messages);
+        const transformed = this.modeController.transformContext(await hooks?.transformContext?.(withRules, signal) ?? withRules);
         if (!this.active?.finalizing) return transformed;
         // Providers can replay historical tool declarations from system messages.
         const withoutTools = transformed.map((message) => {
@@ -122,7 +140,8 @@ export class SessionHandle implements AgentSessionHandle {
           const { toolsAdded, toolsRemoved, ...rest } = message;
           return rest;
         });
-        return [...withoutTools, { role: 'user', content: SUBAGENT_FINAL, timestamp: Date.now() }];
+        if (!prompts.maxStepsSummary.trim()) return withoutTools;
+        return [...withoutTools, { role: 'user', content: wrapSystemUpdate(prompts.maxStepsSummary), timestamp: Date.now() }];
       },
       prepareRequest: this.prepareRequest,
       finishTurn: () => this.active?.finalizing ? { action: 'end' } : undefined,
@@ -151,8 +170,21 @@ export class SessionHandle implements AgentSessionHandle {
         return hooks?.beforeToolCall?.(context, signal);
       },
       afterToolCall: async (context, signal) => {
+        if (options.cwd && context.args && typeof context.args === 'object' && !signal?.aborted) {
+          for (const field of PATH_FIELDS) {
+            const path = (context.args as Record<string, unknown>)[field];
+            if (typeof path !== 'string') continue;
+            try {
+              this.injectRulesForPath(path);
+            } catch {
+              // An unreadable path must not replace the result of a tool that already ran.
+            }
+          }
+        }
         const host = await hooks?.afterToolCall?.(context, signal);
-        if (!options.truncator) return host;
+        // Keep structured answers intact, including long free-form replies.
+        const questionTool = options.questions?.tool;
+        if (!options.truncator || (questionTool && questionTool === this.toolDefinitions.get(context.toolCall.name))) return host;
         const result = {
           content: host?.content ?? context.result.content ?? [],
           details: host?.details ?? context.result.details,
@@ -181,7 +213,7 @@ export class SessionHandle implements AgentSessionHandle {
       readOnly: this.options.subagentProfile?.readOnly === true,
       permissions: this.options.sessionPermissions?.slice(),
       followUp: (input) => this.followUp(input),
-      emit: (runId, event) => this.emit(this.mapper.create(runId, event)),
+      emit: (runId, event) => this.emitRunEvent(runId, event),
     };
   }
 
@@ -198,6 +230,44 @@ export class SessionHandle implements AgentSessionHandle {
         // An observer can fail independently of the conversation and its persistence.
       }
     }
+  }
+
+  emitRunEvent(runId: string, event: AgentCoreEventData): void {
+    this.emit(this.mapper.create(runId, event));
+  }
+
+  injectRulesForPath(targetPath: string): string[] {
+    if (this.closed) return [];
+    const found = this.rulesLoader.discoverForPath(targetPath, this.loadedRulePaths, this.options.cwd);
+    for (const rule of found) this.loadedRulePaths.add(rule.path);
+    this.pendingRules.push(...found);
+    return found.map(({ path }) => path);
+  }
+
+  private transformRuleContext(messages: AgentMessage[]): AgentMessage[] {
+    if (!this.pendingRules.length) return messages;
+    const rules = this.pendingRules.splice(0);
+    const update: RuleUpdateMessage = {
+      role: 'user',
+      content: wrapSystemUpdate(rules.map(({ path, rule }) => `Rules from ${path}:\n\n${rule}`).join('\n\n')),
+      timestamp: Date.now(),
+      rulePaths: rules.map(({ path }) => path),
+    };
+    // Keep the update in the transcript so compaction and branches can restore the path index.
+    const last = messages.at(-1);
+    this.agent.state.messages.push(update);
+    messages.push(update);
+    if (last?.role !== 'user') return messages;
+    return [...messages.slice(0, -2), update, last];
+  }
+
+  private restoreRulePaths(messages: readonly AgentMessage[]): void {
+    this.loadedRulePaths = new Set(this.options.baselineRulePaths);
+    for (const message of messages) {
+      if (!isRuleUpdateMessage(message)) continue;
+      for (const path of message.rulePaths) this.loadedRulePaths.add(path);
+    }
+    for (const { path } of this.pendingRules) this.loadedRulePaths.add(path);
   }
 
   async prompt(input: string, options: PromptOptions = {}): Promise<TurnSummary> {
@@ -274,6 +344,10 @@ export class SessionHandle implements AgentSessionHandle {
     } finally {
       if (this.active) this.active.overflowMessage = undefined;
       await this.persistMessages();
+      const model = this.active?.requestModel;
+      if (this.compaction.precomputeEnabled && model && !signal.aborted && summary.state === 'completed') {
+        this.compaction.maybePrecompute(this.id, model, estimateContextTokens(this.agent.state.messages, this.usageAnchorStart));
+      }
     }
   }
 
@@ -319,7 +393,7 @@ export class SessionHandle implements AgentSessionHandle {
     let { context } = request;
     if (run.retryOverflow && request.model.contextWindow > 0 && !signal?.aborted) {
       const tokens = estimateContextTokens(context.messages, this.usageAnchorStart);
-      if (tokens > request.model.contextWindow - this.compaction.reserveTokens) {
+      if (tokens >= request.model.contextWindow - this.compaction.reserveTokens) {
         const result = await this.compactContext('auto', request.model, run.summary.runId, signal);
         if (result.status === 'compacted') {
           const messages = this.agent.state.messages.slice();
@@ -330,6 +404,8 @@ export class SessionHandle implements AgentSessionHandle {
           }
           context = { ...context, messages };
         }
+      } else {
+        this.compaction.maybePrecompute(this.id, request.model, tokens);
       }
     }
     const update = await this.options.hooks?.prepareRequest?.({ ...request, context }, signal);
@@ -412,6 +488,7 @@ export class SessionHandle implements AgentSessionHandle {
 
   abort(): void {
     this.options.subagents?.abort(this.id);
+    this.compaction.clearPrecompute(this.id);
     this.manualCompaction?.abort();
     const run = this.active;
     if (!run) return;
@@ -439,9 +516,11 @@ export class SessionHandle implements AgentSessionHandle {
   }
 
   branch(fromEntryId: string): Promise<void> {
+    this.compaction.clearPrecompute(this.id);
     const active = this.active?.promise;
     return this.change(async () => {
       await active?.catch(() => undefined);
+      this.compaction.clearPrecompute(this.id);
       await this.persistMessages();
       await this.options.storage.branch(this.id, fromEntryId);
       const projection = await this.options.storage.projectActiveMessages(this.id);
@@ -449,6 +528,7 @@ export class SessionHandle implements AgentSessionHandle {
       this.modeController.setMode(projection.mode);
       this.modelAlias = projection.modelAlias;
       this.planStore.restore(projection.plan);
+      this.pendingRules.length = 0;
       this.restoreMessages(projection.messages, projection.compactedMessageCount);
       const runId = randomUUID();
       if (from !== this.mode) {
@@ -470,6 +550,14 @@ export class SessionHandle implements AgentSessionHandle {
     this.permissions.replyApproval(requestId, decision, this.id);
   }
 
+  getPendingQuestions(): PendingQuestionRequest[] {
+    return this.options.questions?.getPendingQuestions(this.id) ?? [];
+  }
+
+  replyQuestion(requestId: string, answers: QuestionAnswer | { cancelled: true }): void {
+    this.options.questions?.replyQuestion(this.id, requestId, answers);
+  }
+
   compact(customInstructions?: string): Promise<CompactionResult> {
     const active = this.active?.promise;
     return this.change(async () => {
@@ -487,6 +575,7 @@ export class SessionHandle implements AgentSessionHandle {
   }
 
   private restoreMessages(messages: AgentMessage[], compactedMessageCount?: number): void {
+    this.restoreRulePaths(messages);
     const baseline = createInitialSystemMessage(this.options.systemPrompt, undefined);
     this.agent.state.messages = baseline && messages[0]?.role !== 'system' ? [baseline, ...messages] : messages;
     this.savedMessageCount = this.agent.state.messages.length;

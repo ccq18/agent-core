@@ -2,7 +2,8 @@ import { resolve } from 'node:path';
 import { McpBridge } from '../harness/mcp.js';
 import { PermissionEngine } from '../harness/permission.js';
 import { createPlanTools } from '../harness/plan.js';
-import { PromptAssembler } from '../harness/prompt.js';
+import { PromptAssembler, resolvePromptTemplates } from '../harness/prompt.js';
+import { QuestionManager } from '../harness/question.js';
 import { RulesLoader } from '../harness/rules.js';
 import { SkillsRegistry } from '../harness/skills.js';
 import { SubagentManager } from '../harness/subagent.js';
@@ -11,7 +12,7 @@ import { OutputTruncator } from '../harness/truncation.js';
 import { ModelRouter } from '../model/router.js';
 import { CompactionEngine } from '../session/compaction.js';
 import { JsonlTreeSessionStore } from '../session/store.js';
-import type { AgentRuntimeConfig, CreateSessionOptions, ModelRouterConfig, RuntimeCatalog } from '../types/config.js';
+import type { AgentRuntimeConfig, CreateSessionOptions, ModelRouterConfig, PromptTemplates, RuntimeCatalog } from '../types/config.js';
 import type { SessionStorageAdapter, SessionSummary } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
 import { SessionHandle, type AgentSessionHandle } from './session-handle.js';
@@ -40,13 +41,16 @@ class Runtime implements AgentRuntime {
   private readonly loadedRules: Set<string>;
   private readonly skills: SkillsRegistry;
   private readonly prompt = new PromptAssembler();
+  private readonly prompts: PromptTemplates;
   private readonly truncator: OutputTruncator;
   private readonly compaction: CompactionEngine;
   private readonly subagents: SubagentManager;
+  private readonly questions?: QuestionManager;
   private readonly mcp: McpBridge;
   private disposal?: Promise<void>;
 
   constructor(private readonly config: AgentRuntimeConfig) {
+    this.prompts = resolvePromptTemplates(config.prompts, config.baseSystemPrompt);
     this.storage = config.sessionStorage ?? new JsonlTreeSessionStore(config.dataDir);
     this.router = new ModelRouter(config.models);
     this.permissions = new PermissionEngine(config.dataDir, config.defaultPermissionEffect);
@@ -54,18 +58,25 @@ class Runtime implements AgentRuntime {
     this.loadedRules = new Set(this.rules.load());
     this.skills = new SkillsRegistry(config.skillDirs);
     this.truncator = new OutputTruncator(config.dataDir, config.truncation);
-    this.compaction = new CompactionEngine(this.storage, this.router, config.compaction);
+    this.compaction = new CompactionEngine(this.storage, this.router, config.compaction, this.prompts);
     this.subagents = new SubagentManager(this.storage, {
       create: (options) => this.createSession(options),
       open: (id) => this.openSession(id),
       getParent: async (id) => (await this.sessions.get(id))?.getSubagentParent(),
-    }, config.subagents, config.maxSubagentDepth);
+    }, config.subagents, config.maxSubagentDepth, this.prompts.subagentDescription);
+    if (config.enableQuestionTool !== false) {
+      this.questions = new QuestionManager(({ sessionId, runId }, event) => {
+        void this.sessions.get(sessionId)?.then((session) => session.emitRunEvent(runId, event));
+      }, this.prompts.questionDescription);
+    }
     const todoTools = createPlanTools(async (sessionId) => {
       const session = await this.sessions.get(sessionId);
       if (!session) throw new Error(`Unknown session "${sessionId}"`);
       return session.planStore;
-    });
-    this.registry = new ToolRegistry([...todoTools, this.skills.createTool(), this.subagents.tool]);
+    }, this.prompts.todoWriteDescription);
+    const builtIns = [...todoTools, this.skills.createTool(), this.subagents.tool];
+    if (this.questions) builtIns.push(this.questions.tool);
+    this.registry = new ToolRegistry(builtIns);
     this.mcp = new McpBridge(this.registry, config.mcpServers, config.mcpClientFactory);
     this.registerTools(config.tools ?? []);
   }
@@ -97,23 +108,27 @@ class Runtime implements AgentRuntime {
     const pending = this.storage.open(id).then(async ({ header }) => {
       await this.mcp.initialize();
       const cwd = header.cwd ?? (typeof header.metadata?.cwd === 'string' ? header.metadata.cwd : undefined);
-      const rules = this.rules.load(cwd);
+      const { rules, paths } = this.rules.loadWithPaths(cwd);
       const projection = await this.storage.projectActiveMessages(id);
       const metadata = header.metadata;
       const depth = typeof metadata?.depth === 'number' && typeof metadata.parentSessionId === 'string' ? metadata.depth : 0;
       const subagentProfile = depth > 0 && typeof metadata?.subagentProfile === 'string'
         ? this.subagents.getProfile(metadata.subagentProfile) : undefined;
-      const baseSystemPrompt = [this.config.baseSystemPrompt, subagentProfile?.systemPrompt].filter(Boolean).join('\n\n');
+      const prompts = subagentProfile?.systemPrompt ? {
+        ...this.prompts,
+        basePersona: [this.config.prompts?.basePersona ?? this.config.baseSystemPrompt, subagentProfile.systemPrompt]
+          .filter(Boolean).join('\n\n'),
+      } : this.prompts;
       const handle = new SessionHandle({
         id, storage: this.storage, router: this.router, toolRegistry: this.registry,
         systemPrompt: this.prompt.assemble({
-          baseSystemPrompt: subagentProfile?.systemPrompt ? baseSystemPrompt : this.config.baseSystemPrompt,
-          rules, skills: this.skills.modelIndex(), cwd,
+          prompts, rules, skills: this.skills.modelIndex(), cwd,
         }),
         hooks: this.config.hooks, permissionEngine: this.permissions,
         globalPermissions: this.config.permissions, sessionPermissions: header.permissions,
         defaultPermissionEffect: this.config.defaultPermissionEffect, truncator: this.truncator,
         compaction: this.compaction, subagents: this.subagents, subagentProfile, depth, cwd,
+        prompts, questions: this.questions, rulesLoader: this.rules, baselineRulePaths: paths,
         onClose: () => { if (this.sessions.get(id) === pending) this.sessions.delete(id); },
       }, projection);
       for (const rule of rules) this.loadedRules.add(rule);

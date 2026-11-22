@@ -48,11 +48,33 @@ export interface SubagentProfile {
   deniedTools?: string[];
 }
 
+export interface PromptTemplates {
+  /** Base persona for the embedded assistant. */
+  basePersona: string;
+  /** Runtime updates, background results and tool coordination. */
+  harnessProtocol: string;
+  /** Verification, editing and communication conventions. */
+  workingDiscipline: string;
+  /** Reminder shown in Plan mode, optionally wrapped in <system-update>. */
+  planModeEnter: string;
+  /** Reminder after switching back to Build mode. */
+  buildModeEnter: string;
+  todoWriteDescription: string;
+  subagentDescription: string;
+  questionDescription: string;
+  compactionSummary: string;
+  maxStepsSummary: string;
+}
+
 export interface CompactionOptions {
   enabled?: boolean;
   reserveTokens?: number;
   keepRecentTokens?: number;
   modelAlias?: string;
+  /** Compute a candidate summary before the threshold is reached. Defaults to false. */
+  precompute?: boolean;
+  /** Begin precomputing within this many tokens of the threshold. Defaults to 20,000. */
+  precomputeLeadTokens?: number;
 }
 
 export interface McpServerConfig {
@@ -87,6 +109,10 @@ export interface AgentRuntimeConfig {
   sessionStorage?: SessionStorageAdapter;
   tools?: CoreToolDefinition[];
   baseSystemPrompt?: string;
+  /** Replace individual prompt segments. baseSystemPrompt remains the persona fallback. */
+  prompts?: Partial<PromptTemplates>;
+  /** Show the built-in question tool. Defaults to true. */
+  enableQuestionTool?: boolean;
   hooks?: AgentRuntimeHooks;
   /** Rules for resources that match. Unmatched resources use defaultPermissionEffect. */
   permissions?: PermissionRule[];

@@ -1,5 +1,6 @@
 import type { PlanItem, SessionStorageAdapter } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
+import { DEFAULT_PROMPT_TEMPLATES } from './prompt.js';
 
 export class PlanStore {
   private items: PlanItem[];
@@ -31,12 +32,15 @@ export class PlanStore {
   }
 }
 
-export function createPlanTools(getStore: (sessionId: string) => PlanStore | Promise<PlanStore>): CoreToolDefinition[] {
+export function createPlanTools(
+  getStore: (sessionId: string) => PlanStore | Promise<PlanStore>,
+  description = DEFAULT_PROMPT_TEMPLATES.todoWriteDescription,
+): CoreToolDefinition[] {
   return [
     {
       name: 'todowrite',
       label: 'Update plan',
-      description: 'Replace the session plan with the full list of tasks and their statuses.',
+      description,
       readOnly: true,
       executionMode: 'sequential',
       parameters: {

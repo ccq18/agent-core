@@ -1,5 +1,5 @@
 import { rm } from 'node:fs/promises';
-import { getCurrentTools, type TranscriptContext } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream, getCurrentTools, type TranscriptContext } from '@earendil-works/pi-ai';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import {
   estimateContextTokens, estimateMessageTokens, findCutPoint, JsonlTreeSessionStore,
@@ -182,4 +182,140 @@ it.each([false, true])('retries overflow once after a tool call without replayin
   const projected = (await storage.projectActiveMessages(session.id)).messages;
   expect(projected.filter((message) => message.role === 'assistant' && message.stopReason === 'error'))
     .toHaveLength(failRetry ? 1 : 0);
+});
+
+it('shrinks an overflowing summary through 85%, 70%, 50% and 35% while keeping the checkpoint and latest exchange', async () => {
+  const storage = new JsonlTreeSessionStore(dir);
+  const history: string[] = [];
+  const core = runtime(dir, (model, context) => {
+    const last = context.messages.at(-1);
+    if (summarizes(context) && last?.role === 'user' && typeof last.content === 'string') {
+      history.push(last.content);
+      if (history.length < 5) throw new Error('context_length_exceeded');
+      return reply(model, text('Reduced checkpoint'));
+    }
+    const latest = last?.role === 'user' ? last.content : undefined;
+    const input = Array.isArray(latest) ? latest.find((block) => block.type === 'text')?.text : latest;
+    if (input?.startsWith('old lookup')) {
+      return reply(model, call('lookup', { query: 'argument'.repeat(300) }));
+    }
+    return reply(model, text('Done'));
+  }, {
+    sessionStorage: storage,
+    compaction: { keepRecentTokens: 40, reserveTokens: 0 },
+    tools: [tool('lookup', { execute: async () => ({ content: [text('r'.repeat(3000))] }) })],
+  });
+  cores.push(core);
+  const header = await storage.create();
+  await storage.append(header.id, {
+    type: 'compaction', summary: 'Previous summary to keep', firstKeptEntryId: null, tokensBefore: 100,
+  });
+  const session = await core.openSession(header.id);
+  await session.prompt('old lookup ' + 'Old detail '.repeat(350));
+  await session.prompt('Latest summarized exchange');
+  await session.prompt('Recent retained request '.repeat(12));
+  await expect(session.compact()).resolves.toMatchObject({ status: 'compacted', summary: 'Reduced checkpoint' });
+
+  expect(history).toHaveLength(5);
+  expect(history[0]).toContain('r'.repeat(2000));
+  expect(history[1]).toContain('r'.repeat(800));
+  expect(history[1]).not.toContain('r'.repeat(801));
+  expect(history[2]).toContain('[toolResult omitted]');
+  expect(history[2]).not.toContain('argument'.repeat(300));
+  expect(history[4]).not.toContain('Old detail');
+  for (const [index, ratio] of [0.85, 0.70, 0.50, 0.35].entries()) {
+    expect(history[index + 1].length).toBeLessThanOrEqual(Math.floor(history[0].length * ratio));
+    expect(history[index + 1].length).toBeLessThan(history[index].length);
+    expect(history[index + 1]).toContain('Previous summary to keep');
+    expect(history[index + 1]).toContain('Latest summarized exchange');
+  }
+});
+
+it.each(['reuse', 'branch', 'pending', 'abort', 'close'] as const)('handles background precomputation at the auto cut (%s)', async (outcome) => {
+  const storage = new JsonlTreeSessionStore(dir);
+  const started = Promise.withResolvers<void>();
+  const summaries: TranscriptContext[] = [];
+  const requests: TranscriptContext[] = [];
+  let backgroundSignal: AbortSignal | undefined;
+  const core = runtime(dir, async (model, context, options) => {
+    if (summarizes(context)) {
+      summaries.push(context);
+      if (summaries.length === 1) {
+        backgroundSignal = options?.signal;
+        started.resolve();
+        if (outcome === 'pending') return createAssistantMessageEventStream();
+      }
+      return reply(model, text(summaries.length === 1 ? 'Background checkpoint' : 'Fresh checkpoint'));
+    }
+    requests.push(context);
+    const response = reply(model, text('Done'));
+    (await response.result()).usage.totalTokens = requests.length === 1 ? 700 : requests.length === 2 ? 1400 : 0;
+    return response;
+  }, { sessionStorage: storage, compaction: {
+    reserveTokens: 2496, keepRecentTokens: 15, precompute: true, precomputeLeadTokens: 400,
+  } });
+  cores.push(core);
+  let session = await core.createSession();
+  const events: AgentCoreEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  await session.prompt('Old history '.repeat(20));
+  await session.prompt('Second request '.repeat(25));
+  await started.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const before = await storage.getBranch(session.id);
+  expect(summaries).toHaveLength(1);
+  expect(before.some(({ type }) => type === 'compaction')).toBe(false);
+  expect(events.some(({ type }) => type.startsWith('compaction_'))).toBe(false);
+  if (outcome === 'branch') await session.branch(before.at(-2)!.id);
+  if (outcome === 'abort') session.abort();
+  if (outcome === 'close') {
+    await session.close();
+    session = await core.openSession(session.id);
+  }
+
+  await expect(session.prompt('New request '.repeat(outcome === 'branch' ? 310 : 100)))
+    .resolves.toMatchObject({ state: 'completed' });
+  expect(summaries).toHaveLength(outcome === 'reuse' ? 1 : 2);
+  expect(JSON.stringify(requests.at(-1)?.messages)).toContain(outcome === 'reuse' ? 'Background checkpoint' : 'Fresh checkpoint');
+  expect(JSON.stringify(requests.at(-1)?.messages)).toContain('New request');
+  if (outcome === 'reuse') expect(JSON.stringify(requests.at(-1)?.messages)).toContain('Second request');
+  if (outcome === 'pending' || outcome === 'abort' || outcome === 'close') {
+    expect(backgroundSignal?.aborted).toBe(true);
+  }
+});
+
+it('keeps summary precomputation disabled by default', async () => {
+  const summaries: TranscriptContext[] = [];
+  const core = runtime(dir, (model, context) => {
+    if (summarizes(context)) summaries.push(context);
+    return reply(model, text('Done'));
+  }, { compaction: { reserveTokens: 1000, keepRecentTokens: 5 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('First turn '.repeat(30));
+  await session.prompt('Second turn '.repeat(30));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(summaries).toHaveLength(0);
+});
+
+it.each([
+  { message: 'context_length_exceeded', attempts: 5 },
+  { message: 'rate limit: too many tokens', attempts: 1 },
+])('fails without writing a checkpoint on "$message"', async ({ message, attempts }) => {
+  const storage = new JsonlTreeSessionStore(dir);
+  let calls = 0;
+  const core = runtime(dir, (model, context) => {
+    if (summarizes(context)) {
+      calls++;
+      throw new Error(message);
+    }
+    return reply(model, text('Done'));
+  }, { sessionStorage: storage, compaction: { keepRecentTokens: 5, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old material '.repeat(30));
+  await session.prompt('Latest material to keep in context');
+  await expect(session.compact()).resolves.toEqual({ status: 'failed', error: message });
+  expect(calls).toBe(attempts);
+  expect((await storage.getBranch(session.id)).some(({ type }) => type === 'compaction')).toBe(false);
 });

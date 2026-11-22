@@ -235,7 +235,7 @@ describe('Phase 1 runtime', () => {
     const [model, { messages }] = stream.mock.calls.at(-1)!;
     expect(model.id).toBe('fast-model');
     expect(messages.map((message) => message.role)).toEqual(['system', 'system', 'user', 'assistant', 'user', 'assistant', 'user', 'user']);
-    expect(userTexts({ messages })).toEqual(['First', 'Second', 'Third', expect.stringContaining('Plan mode is active')]);
+    expect(userTexts({ messages })).toEqual(['First', 'Second', expect.stringContaining('Plan mode is active'), 'Third']);
     await reopened.deleteSession(restored.id);
     expect(await reopened.listSessions()).toEqual([]);
   });
@@ -263,7 +263,7 @@ describe('Phase 1 runtime', () => {
     await session.prompt('Alternative branch');
     const [model, transcript] = stream.mock.calls.at(-1)!;
     expect(model.id).toBe('test-model');
-    expect(userTexts(transcript)).toEqual(['Root', 'Alternative branch', expect.stringContaining('Build mode is active')]);
+    expect(userTexts(transcript)).toEqual(['Root', expect.stringContaining('Build mode is active'), 'Alternative branch']);
     expect(await storage.getBranch(session.id, formerLeaf.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'model', modelAlias: 'fast' }),
     ]));

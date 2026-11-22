@@ -1,6 +1,7 @@
 export * from './types/config.js';
 export * from './types/events.js';
 export * from './types/permission.js';
+export * from './types/question.js';
 export * from './types/session.js';
 export * from './types/tool.js';
 export * from './model/router.js';
@@ -12,6 +13,7 @@ export * from './runtime/agent-runtime.js';
 export * from './harness/permission.js';
 export * from './harness/mode.js';
 export * from './harness/plan.js';
+export * from './harness/question.js';
 export * from './harness/truncation.js';
 export { RulesLoader } from './harness/rules.js';
 export * from './harness/skills.js';

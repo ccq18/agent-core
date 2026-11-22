@@ -1,8 +1,9 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import type { JsonObject, TranscriptContext } from '@earendil-works/pi-ai';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { RulesLoader, type AgentRuntime } from '../src/index.js';
-import { call, reply, runtime, testDirectory } from './harness-fixtures.js';
+import { call, reply, runtime, testDirectory, tool } from './harness-fixtures.js';
 
 let dir: string;
 const cores: AgentRuntime[] = [];
@@ -88,4 +89,73 @@ it('indexes permitted skill metadata, loads skill content on demand, and applies
   ]);
   const session = await core.createSession();
   await expect(session.prompt('Load skills')).resolves.toMatchObject({ text: 'done' });
+});
+
+it('injects newly discovered rules after a tool call, deduplicates aliases and stays inside cwd', async () => {
+  const cwd = join(dir, 'project');
+  const subdir = join(cwd, 'component');
+  const outside = join(dir, 'outside');
+  await mkdir(subdir, { recursive: true });
+  await mkdir(outside);
+  await writeFile(join(cwd, 'AGENTS.md'), 'Baseline rule');
+  await writeFile(join(subdir, 'AGENTS.md'), 'Component instructions');
+  await writeFile(join(outside, 'AGENTS.md'), 'External instructions');
+  await symlink(outside, join(cwd, 'escape'), 'dir');
+  const paths: JsonObject[] = [
+    { file_path: 'component/file.ts' }, { filePath: join(subdir, 'file.ts') },
+    { directory: outside }, { cwd: 'escape' }, { path: 'https://example.test/component/file.ts' },
+  ];
+  let step = 0;
+  const core = runtime(dir, (model, { messages }) => {
+    expect(JSON.stringify(messages[0])).toContain('Baseline rule');
+    expect(JSON.stringify(messages)).not.toContain('External instructions');
+    const updates = messages.filter((message) =>
+      message.role === 'user' && typeof message.content === 'string' && message.content.includes('Component instructions'));
+    expect(updates).toHaveLength(step ? 1 : 0);
+    if (step > 0) expect(updates[0]).toMatchObject({
+      content: expect.stringMatching(/<system-update>[^]*AGENTS\.md[^]*Component instructions/),
+    });
+    const args = paths[step++];
+    return args ? reply(model, call('inspect', args)) : reply(model, { type: 'text', text: 'done' });
+  }, { tools: [tool('inspect', { readOnly: true })] });
+  cores.push(core);
+  const session = await core.createSession({ cwd });
+  await expect(session.prompt('Read a component file')).resolves.toMatchObject({ text: 'done' });
+  expect(session.injectRulesForPath(subdir)).toEqual([]);
+  expect(session.injectRulesForPath(outside)).toEqual([]);
+});
+
+it('lets a session rediscover a dynamic rule after compaction removes the original update', async () => {
+  const cwd = join(dir, 'project');
+  const subdir = join(cwd, 'component');
+  await mkdir(subdir, { recursive: true });
+  await writeFile(join(subdir, 'CLAUDE.md'), 'Component instructions');
+  const contexts: TranscriptContext[] = [];
+  const core = runtime(dir, (model, context) => {
+    contexts.push(context);
+    return reply(model, { type: 'text', text: 'Done' });
+  }, { compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession({ cwd });
+  expect(session.injectRulesForPath('component')).toEqual([join(subdir, 'CLAUDE.md')]);
+  await session.prompt('Original request');
+  await session.prompt('Keep this long recent request in context');
+  await expect(session.compact()).resolves.toMatchObject({ status: 'compacted' });
+  expect(session.injectRulesForPath('component')).toEqual([join(subdir, 'CLAUDE.md')]);
+  await session.prompt('Return to the component');
+  expect(contexts.at(-1)?.messages).toContainEqual(expect.objectContaining({
+    role: 'user', content: expect.stringContaining('Component instructions'),
+  }));
+});
+
+it('skips automatic discovery in a session without cwd', async () => {
+  await writeFile(join(dir, 'AGENTS.md'), 'Discovered instructions');
+  const core = runtime(dir, (model, { messages }) => {
+    if (messages.at(-1)?.role !== 'toolResult') return reply(model, call('inspect', { directory: dir }));
+    expect(JSON.stringify(messages)).not.toContain('Discovered instructions');
+    return reply(model, { type: 'text', text: 'Done' });
+  }, { tools: [tool('inspect', { readOnly: true })] });
+  cores.push(core);
+  const session = await core.createSession();
+  await expect(session.prompt('Inspect the directory')).resolves.toMatchObject({ text: 'Done' });
 });
