@@ -1,18 +1,21 @@
 import { rm } from 'node:fs/promises';
 import { createAssistantMessageEventStream, getCurrentTools, type TranscriptContext } from '@earendil-works/pi-ai';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
   estimateContextTokens, estimateMessageTokens, findCutPoint, JsonlTreeSessionStore,
   type AgentCoreEvent, type AgentRuntime, type SessionEntry,
 } from '../src/index.js';
-import { call, reply, runtime, testDirectory, tool } from './harness-fixtures.js';
+import { call, legacyStorage, reply, runtime, testDirectory, tool } from './harness-fixtures.js';
 
 let dir: string;
 const cores: AgentRuntime[] = [];
 beforeEach(async () => { dir = await testDirectory(); });
 afterEach(async () => {
-  await Promise.all(cores.splice(0).map((core) => core.dispose()));
-  await rm(dir, { recursive: true, force: true });
+  try {
+    await Promise.all(cores.splice(0).map((core) => core.dispose()));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 const text = (text: string) => ({ type: 'text' as const, text });
@@ -146,7 +149,13 @@ it('uses the configured summary model and bounds the serialized output of each o
   await expect(session.compact()).resolves.toMatchObject({ status: 'compacted', summary: 'Summarized tool output' });
 });
 
-it.each([false, true])('retries overflow once after a tool call without replaying it (retry fails: %s)', async (failRetry) => {
+it.each([
+  { error: 'context_length_exceeded', failRetry: false },
+  { error: 'context_length_exceeded', failRetry: true },
+  { error: 'Your input exceeds the context window of this model', failRetry: false },
+  { error: 'The input token count (4200) exceeds the maximum number of tokens allowed (4096)', failRetry: false },
+  { error: 'maximum context reached', failRetry: false },
+])('retries "$error" once after a tool call without replaying it (retry fails: $failRetry)', async ({ error, failRetry }) => {
   const storage = new JsonlTreeSessionStore(dir);
   let attempts = 0;
   let toolCalls = 0;
@@ -154,7 +163,7 @@ it.each([false, true])('retries overflow once after a tool call without replayin
     if (summarizes(context)) return reply(model, text('Recovered context'));
     if (context.messages.filter(({ role }) => role !== 'system').at(-1)?.role === 'toolResult') {
       attempts++;
-      if (attempts === 1 || failRetry) throw Error('context_length_exceeded');
+      if (attempts === 1 || failRetry) throw Error(error);
       expect(JSON.stringify(context.messages)).toContain('Recovered context');
       return reply(model, text('Recovered'));
     }
@@ -174,7 +183,7 @@ it.each([false, true])('retries overflow once after a tool call without replayin
   await session.prompt('Old history '.repeat(30));
   const result = await session.prompt('Trigger retry');
   expect(result).toMatchObject(failRetry
-    ? { state: 'failed', error: 'context_length_exceeded' }
+    ? { state: 'failed', error }
     : { state: 'completed', text: 'Recovered', error: undefined });
   expect(attempts).toBe(2);
   expect(toolCalls).toBe(1);
@@ -182,6 +191,58 @@ it.each([false, true])('retries overflow once after a tool call without replayin
   const projected = (await storage.projectActiveMessages(session.id)).messages;
   expect(projected.filter((message) => message.role === 'assistant' && message.stopReason === 'error'))
     .toHaveLength(failRetry ? 1 : 0);
+});
+
+it.each(['stop', 'length'] as const)('compacts a silent %s overflow using the prepared context window', async (reason) => {
+  let requests = 0;
+  let summaries = 0;
+  const core = runtime(dir, async (model, context) => {
+    if (summarizes(context)) {
+      summaries++;
+      return reply(model, text('Checkpoint'));
+    }
+    if (++requests !== 2) return reply(model, text('Done'));
+    const message = await reply(model).result();
+    message.usage.input = reason === 'stop' ? 1001 : 1000;
+    message.stopReason = reason;
+    const stream = createAssistantMessageEventStream();
+    stream.push({ type: 'done', reason, message });
+    return stream;
+  }, {
+    hooks: { prepareRequest: ({ model }) => ({ model: { ...model, contextWindow: 1000 } }) },
+    compaction: { reserveTokens: 0, keepRecentTokens: 10 },
+  });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old history '.repeat(30));
+  await expect(session.prompt('Try again')).resolves.toMatchObject({ state: 'completed', text: 'Done' });
+  expect(summaries).toBe(1);
+  expect(requests).toBe(3);
+});
+
+it.each([
+  'Rate limit exceeded: maximum context reached',
+  '429: too many tokens',
+  'API 429: context_length_exceeded',
+  'OpenAI API error (429): exceeds the context window',
+  'rate_limit_exceeded: too many tokens',
+])('returns a rate limit error without compacting or retrying: %s', async (error) => {
+  let requests = 0;
+  let summaries = 0;
+  const core = runtime(dir, (model, context) => {
+    if (summarizes(context)) {
+      summaries++;
+      return reply(model, text('Checkpoint'));
+    }
+    if (++requests > 1) throw Error(error);
+    return reply(model, text('Done'));
+  }, { compaction: { reserveTokens: 0, keepRecentTokens: 10 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old history '.repeat(30));
+  await expect(session.prompt('Next')).resolves.toMatchObject({ state: 'failed', error });
+  expect(summaries).toBe(0);
+  expect(requests).toBe(2);
 });
 
 it('shrinks an overflowing summary through 85%, 70%, 50% and 35% while keeping the checkpoint and latest exchange', async () => {
@@ -317,5 +378,149 @@ it.each([
   await session.prompt('Latest material to keep in context');
   await expect(session.compact()).resolves.toEqual({ status: 'failed', error: message });
   expect(calls).toBe(attempts);
+  expect((await storage.getBranch(session.id)).some(({ type }) => type === 'compaction')).toBe(false);
+});
+
+it('uses the actual summary model budget on the first request and drains the returned event stream', async () => {
+  const lengths: number[] = [];
+  let drained = 0;
+  const streamOverride: Parameters<typeof runtime>[1] = (model, context) => {
+    if (!summarizes(context)) return reply(model, text('Done'));
+    const last = context.messages.at(-1);
+    expect(model.id).toBe('small');
+    if (last?.role !== 'user' || typeof last.content !== 'string') throw Error('Missing summary input');
+    lengths.push(last.content.length);
+    expect(last.content).toContain('Newest complete exchange');
+    expect(last.content).toContain('Follow this instruction');
+    const stream = reply(model, text('Summary'));
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        drained++;
+        yield event;
+      }
+    };
+    return stream;
+  };
+  const core = runtime(dir, streamOverride, {
+    models: {
+      defaultAlias: 'main',
+      profiles: ['main', 'small'].map((alias) => ({
+        alias, modelId: alias, providerId: 'local', protocol: 'openai-completions',
+        baseUrl: 'http://127.0.0.1:9999/v1', contextWindow: alias === 'small' ? 1024 : 32768, maxTokens: 256,
+      })),
+      streamFnOverride: streamOverride,
+    },
+    compaction: { modelAlias: 'small', keepRecentTokens: 40 },
+  });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Very old detail '.repeat(800));
+  await session.prompt('Newest complete exchange');
+  await session.prompt('Retained request '.repeat(30));
+  await expect(session.compact('Follow this instruction')).resolves.toMatchObject({ status: 'compacted' });
+  expect(lengths).toHaveLength(1);
+  expect(lengths[0]).toBeLessThan((1024 - 256) * 4);
+  expect(drained).toBe(1);
+});
+
+it.each([
+  new Error('API 429: context_length_exceeded'),
+  new Error('HTTP 429: context_length_exceeded'),
+  new Error('status code 429: context_length_exceeded'),
+  new Error('error=429: context_length_exceeded'),
+  new Error('code: "429" context_length_exceeded'),
+  Object.assign(new Error('context_length_exceeded'), { status: 429 }),
+  new Error('Rate_limit: too many tokens'),
+])('does not shrink or retry when the summary provider returns %s', async (error) => {
+  let requests = 0;
+  const core = runtime(dir, (model, context) => {
+    if (!summarizes(context)) return reply(model, text('Done'));
+    requests++;
+    throw error;
+  }, { compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old conversation');
+  await session.prompt('Recent conversation');
+  await expect(session.compact()).resolves.toMatchObject({ status: 'failed' });
+  expect(requests).toBe(1);
+});
+
+it.each(['window', 'legacy'] as const)('rejects a stale compaction at commit through %s storage', async (kind) => {
+  const store = new JsonlTreeSessionStore(dir);
+  const getBranch = vi.spyOn(store, 'getBranch');
+  const getWindow = vi.spyOn(store, 'getCompactionWindow');
+  const { id } = await store.create();
+  const core = runtime(dir, async (model, context) => {
+    if (!summarizes(context)) return reply(model, text('Done'));
+    await store.append(id, { type: 'metadata', metadata: { title: 'Updated during summary' } });
+    return reply(model, text('Stale checkpoint'));
+  }, { sessionStorage: kind === 'window' ? store : legacyStorage(store), compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.openSession(id);
+  await session.prompt('Old conversation');
+  await session.prompt('Recent conversation');
+  await expect(session.compact()).resolves.toEqual({ status: 'failed', error: 'Session branch changed during compaction' });
+  expect(getWindow).toHaveBeenCalledTimes(kind === 'window' ? 1 : 0);
+  expect(getBranch).toHaveBeenCalledTimes(kind === 'window' ? 0 : 2);
+  expect((await store.getBranch(id)).some(({ type }) => type === 'compaction')).toBe(false);
+});
+
+it('does not append through a legacy adapter if cancellation arrives during the final branch read', async () => {
+  const store = new JsonlTreeSessionStore(dir);
+  const storage = legacyStorage(store);
+  const core = runtime(dir, (model, context) =>
+    reply(model, text(summarizes(context) ? 'Checkpoint' : 'Done')),
+  { sessionStorage: storage, compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old conversation');
+  await session.prompt('Recent conversation');
+  const read = storage.getBranch;
+  vi.spyOn(storage, 'getBranch').mockImplementationOnce(read).mockImplementationOnce(async (id) => {
+    const branch = await read(id);
+    session.abort();
+    return branch;
+  });
+  await expect(session.compact()).resolves.toEqual({ status: 'skipped', reason: 'aborted' });
+  expect((await store.getBranch(session.id)).some(({ type }) => type === 'compaction')).toBe(false);
+});
+
+it('forwards cancellation to the summary producer and drains its final abort event', async () => {
+  const storage = new JsonlTreeSessionStore(dir);
+  const started = Promise.withResolvers<AbortSignal>();
+  const drained = Promise.withResolvers<void>();
+  const core = runtime(dir, async (model, context, options) => {
+    if (!summarizes(context)) return reply(model, text('Done'));
+    const stream = createAssistantMessageEventStream();
+    const partial = await reply(model, text('')).result();
+    stream.push({ type: 'start', partial });
+    const iterate = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      for await (const event of { [Symbol.asyncIterator]: iterate }) {
+        yield event;
+      }
+      drained.resolve();
+    };
+    const signal = options!.signal!;
+    signal.addEventListener('abort', () => {
+      stream.push({ type: 'error', reason: 'aborted', error: { ...partial, stopReason: 'aborted' } });
+    }, { once: true });
+    started.resolve(signal);
+    return stream;
+  }, { sessionStorage: storage, compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await session.prompt('Old conversation');
+  await session.prompt('Recent conversation');
+  const pending = session.compact();
+  const checked = expect(pending).resolves.toEqual({ status: 'skipped', reason: 'aborted' });
+  const signal = await started.promise;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  session.abort();
+  await checked;
+  await drained.promise;
+  expect(signal.aborted).toBe(true);
   expect((await storage.getBranch(session.id)).some(({ type }) => type === 'compaction')).toBe(false);
 });

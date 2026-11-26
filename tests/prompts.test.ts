@@ -18,25 +18,26 @@ it('resolves every default segment and uses the legacy persona when an override 
 it('uses host templates in the transcript, reminders, tool declarations and compaction request', async () => {
   const dir = await testDirectory();
   const contexts: TranscriptContext[] = [];
-  const core = runtime(dir, (model, context) => {
-    contexts.push(context);
-    return reply(model, { type: 'text', text: 'Done' });
-  }, {
-    baseSystemPrompt: 'Legacy persona',
-    prompts: {
-      basePersona: 'Project leader',
-      harnessProtocol: 'Custom protocol',
-      workingDiscipline: 'Custom discipline',
-      planModeEnter: '<system-update>Custom plan reminder</system-update>',
-      buildModeEnter: 'Custom build reminder',
-      todoWriteDescription: 'Custom todo',
-      subagentDescription: 'Custom delegation',
-      questionDescription: 'Custom question',
-      compactionSummary: 'Custom checkpoint',
-    },
-    compaction: { keepRecentTokens: 4, reserveTokens: 0 },
-  });
+  let core: ReturnType<typeof runtime> | undefined;
   try {
+    core = runtime(dir, (model, context) => {
+      contexts.push(context);
+      return reply(model, { type: 'text', text: 'Done' });
+    }, {
+      baseSystemPrompt: 'Legacy persona',
+      prompts: {
+        basePersona: 'Project leader',
+        harnessProtocol: 'Custom protocol',
+        workingDiscipline: 'Custom discipline',
+        planModeEnter: '<system-update>Custom plan reminder</system-update>',
+        buildModeEnter: 'Custom build reminder',
+        todoWriteDescription: 'Custom todo',
+        subagentDescription: 'Custom delegation',
+        questionDescription: 'Custom question',
+        compactionSummary: 'Custom checkpoint',
+      },
+      compaction: { keepRecentTokens: 4, reserveTokens: 0 },
+    });
     expect(core.getCatalog().tools).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'todowrite', description: 'Custom todo' }),
       expect.objectContaining({ name: 'subagent', description: 'Custom delegation' }),
@@ -68,34 +69,41 @@ it('uses host templates in the transcript, reminders, tool declarations and comp
     await expect(session.compact()).resolves.toMatchObject({ status: 'compacted', summary: 'Done' });
     expect(contexts[3].messages[0]).toMatchObject({ role: 'system', content: 'Custom checkpoint' });
   } finally {
-    await core.dispose();
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await core?.dispose();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });
 
 it('applies the max-step template to the final tool-free subagent request', async () => {
   const dir = await testDirectory();
-  const core = runtime(dir, (model, context, options) => {
-    if (JSON.stringify(context.messages).includes('Delegation request')) {
-      const last = context.messages.at(-1);
-      if (last?.role !== 'toolResult') {
-        return reply(model, call('subagent', { agent: 'brief', description: 'Gather facts', prompt: 'Child request' }));
-      }
-      expect(last.content).toContainEqual({ type: 'text', text: 'Child conclusion' });
-      return reply(model, { type: 'text', text: 'Done' });
-    }
-    expect(getCurrentTools(context.messages)).toEqual([]);
-    expect(options?.toolChoice).toBe('none');
-    expect(context.messages.at(-1)).toMatchObject({
-      role: 'user', content: '<system-update>\nHost final instructions\n</system-update>',
-    });
-    return reply(model, { type: 'text', text: 'Child conclusion' });
-  }, { prompts: { maxStepsSummary: 'Host final instructions' }, subagents: { brief: { maxSteps: 1 } } });
+  let core: ReturnType<typeof runtime> | undefined;
   try {
+    core = runtime(dir, (model, context, options) => {
+      if (JSON.stringify(context.messages).includes('Delegation request')) {
+        const last = context.messages.at(-1);
+        if (last?.role !== 'toolResult') {
+          return reply(model, call('subagent', { agent: 'brief', description: 'Gather facts', prompt: 'Child request' }));
+        }
+        expect(last.content).toContainEqual({ type: 'text', text: 'Child conclusion' });
+        return reply(model, { type: 'text', text: 'Done' });
+      }
+      expect(getCurrentTools(context.messages)).toEqual([]);
+      expect(options?.toolChoice).toBe('none');
+      expect(context.messages.at(-1)).toMatchObject({
+        role: 'user', content: '<system-update>\nHost final instructions\n</system-update>',
+      });
+      return reply(model, { type: 'text', text: 'Child conclusion' });
+    }, { prompts: { maxStepsSummary: 'Host final instructions' }, subagents: { brief: { maxSteps: 1 } } });
     const session = await core.createSession();
     await expect(session.prompt('Delegation request')).resolves.toMatchObject({ state: 'completed', text: 'Done' });
   } finally {
-    await core.dispose();
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await core?.dispose();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 });

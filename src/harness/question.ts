@@ -4,6 +4,9 @@ import type { PendingQuestionRequest, QuestionAnswer, QuestionItem } from '../ty
 import type { CoreToolDefinition, ToolExecutionContext } from '../types/tool.js';
 import { DEFAULT_PROMPT_TEMPLATES } from './prompt.js';
 
+const DEFAULT_DESCRIPTION = DEFAULT_PROMPT_TEMPLATES.questionDescription +
+  ' Call question on its own when you need user input. Mixing it with slow tools in the same batch makes the whole batch run sequentially.';
+
 type QuestionReply = QuestionAnswer | { cancelled: true };
 type QuestionEvent = Extract<AgentCoreEventData, { type: 'question_requested' | 'question_resolved' }>;
 type QuestionResult = { cancelled: true } | { cancelled: false; answers: QuestionAnswer };
@@ -22,7 +25,7 @@ export class QuestionManager {
   readonly tool: CoreToolDefinition = {
     name: 'question',
     label: 'Ask the user',
-    description: DEFAULT_PROMPT_TEMPLATES.questionDescription,
+    description: DEFAULT_DESCRIPTION,
     permissionAction: 'question',
     readOnly: true,
     executionMode: 'sequential',
@@ -60,9 +63,9 @@ export class QuestionManager {
 
   constructor(
     private readonly emit: (request: PendingQuestionRequest, event: QuestionEvent) => void,
-    description = DEFAULT_PROMPT_TEMPLATES.questionDescription,
+    description = DEFAULT_DESCRIPTION,
   ) {
-    this.tool.description = description;
+    this.tool.description = description === DEFAULT_PROMPT_TEMPLATES.questionDescription ? DEFAULT_DESCRIPTION : description;
   }
 
   getPendingQuestions(sessionId: string): PendingQuestionRequest[] {

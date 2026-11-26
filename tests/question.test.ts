@@ -8,8 +8,11 @@ let dir: string;
 const cores: AgentRuntime[] = [];
 beforeEach(async () => { dir = await testDirectory(); });
 afterEach(async () => {
-  await Promise.all(cores.splice(0).map((core) => core.dispose()));
-  await rm(dir, { recursive: true, force: true });
+  try {
+    await Promise.all(cores.splice(0).map((core) => core.dispose()));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 const questions: JsonObject[] = [

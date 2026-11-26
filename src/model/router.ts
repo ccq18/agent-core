@@ -26,6 +26,14 @@ interface Route extends ResolvedModel {
   override?: StreamFn;
 }
 
+function sameEndpoint(a: Model<Api>, b: Model<Api>): boolean {
+  return a.provider === b.provider && a.api === b.api && a.id === b.id && a.baseUrl === b.baseUrl;
+}
+
+function snapshotModel(model: Model<Api>): Model<Api> {
+  return { ...model, headers: model.headers && { ...model.headers } };
+}
+
 function isLocalGateway(baseUrl: string): boolean {
   const hostname = URL.parse(baseUrl)?.hostname;
   if (!hostname) return false;
@@ -54,6 +62,15 @@ export class ModelRouter {
 
   listProfiles(): ModelProfile[] {
     return [...this.routes.values()].map(({ profile }) => profile);
+  }
+
+  prepareModel(original: Model<Api>, updated: Model<Api>): Model<Api> {
+    // A hook may reuse its object across sessions. Bind a request-local copy to this route.
+    const model = snapshotModel(updated);
+    const route = this.routesByModel.get(updated) ??
+      (sameEndpoint(original, updated) ? this.routesByModel.get(original) : undefined);
+    if (route) this.routesByModel.set(model, route);
+    return model;
   }
 
   updateConfig(config: ModelRouterConfig): void {
@@ -96,10 +113,13 @@ export class ModelRouter {
     try {
       signal?.throwIfAborted();
       const route = this.routesByModel.get(model) ?? [...this.routes.values()].find(({ model: candidate }) =>
-        candidate.provider === model.provider && candidate.api === model.api &&
-        candidate.id === model.id && candidate.baseUrl === model.baseUrl,
-      );
+        sameEndpoint(candidate, model));
       if (!route) throw new Error(`No route for model "${model.provider}/${model.id}"`);
+      const requestModel = snapshotModel(model);
+      const headerEntries = new Map(
+        [...Object.entries(requestModel.headers ?? {}), ...Object.entries(options?.headers ?? {})]
+          .map(([name, value]) => [name.toLowerCase(), { name, value }]),
+      );
       let apiKey = options?.apiKey;
       if (!apiKey) {
         const key = route.profile.apiKey;
@@ -110,31 +130,30 @@ export class ModelRouter {
           apiKey = key;
         }
       }
-      const headerEntries = new Map(
-        [...Object.entries(model.headers ?? {}), ...Object.entries(options?.headers ?? {})]
-          .map(([name, value]) => [name.toLowerCase(), { name, value }]),
-      );
       const hasAuth = headerEntries.get('authorization')?.value?.trim() ||
         headerEntries.get('cf-aig-authorization')?.value?.trim();
-      if (!apiKey && !hasAuth && (model.api === 'openai-completions' || model.api === 'openai-responses') &&
-        isLocalGateway(model.baseUrl)) {
+      if (!apiKey && !hasAuth && (requestModel.api === 'openai-completions' || requestModel.api === 'openai-responses') &&
+        isLocalGateway(requestModel.baseUrl)) {
         apiKey = 'local-no-key';
       }
       const headers = Object.fromEntries([...headerEntries.values()].map(({ name, value }) => [name, value]));
       const requestOptions = { ...options, apiKey, headers };
-      if (!route.override) return route.models.streamSimple(model, context, requestOptions);
-      const pending = Promise.resolve(route.override(model, context, requestOptions));
+      if (!route.override) return route.models.streamSimple(requestModel, context, requestOptions);
+      const pending = Promise.resolve(route.override(requestModel, context, requestOptions));
       return await (signal ? raceWithAbortSignal(pending, signal) : pending);
     } catch (error) {
       const stream = createAssistantMessageEventStream();
       const reason = signal?.aborted ? 'aborted' : 'error';
+      const message = error instanceof Error ? error.message : String(error);
+      const status = error && typeof error === 'object' ? error as { status?: unknown; statusCode?: unknown } : undefined;
+      const errorMessage = status?.status === 429 || status?.statusCode === 429 ? `HTTP 429: ${message}` : message;
       stream.push({
         type: 'error', reason,
         error: {
           role: 'assistant', api: model.api, provider: model.provider, model: model.id, content: [],
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-          stopReason: reason, errorMessage: error instanceof Error ? error.message : String(error), timestamp: Date.now(),
+          stopReason: reason, errorMessage, timestamp: Date.now(),
         },
       });
       return stream;

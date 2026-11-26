@@ -9,6 +9,18 @@ export interface CoreToolResult {
   terminate?: boolean;
 }
 
+export interface TruncatedOutputDetails {
+  truncated: true;
+  outputPath: string;
+  totalLines?: number;
+  totalBytes?: number;
+  /** Number of complete lines retained in the preview. */
+  keptLines?: number;
+  /** Includes any line that is only partially visible. */
+  omittedLines?: number;
+  strategy?: 'head-tail' | 'head';
+}
+
 export interface ToolExecutionContext {
   sessionId: string;
   runId: string;

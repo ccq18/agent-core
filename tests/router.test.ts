@@ -78,6 +78,37 @@ describe('ModelRouter', () => {
     expect(stream.mock.calls[4]?.[2]?.headers).toMatchObject({ Authorization: 'Custom token' });
   });
 
+  it('snapshots the headers of a model prepared by a hook', async () => {
+    const stream = vi.fn<StreamFn>(createAssistantMessageEventStream);
+    const router = new ModelRouter({ defaultAlias: 'local', profiles: [profile], streamFnOverride: stream });
+    const original = router.resolve().model;
+    const headers = { Authorization: 'fixture-before' };
+    const prepared = router.prepareModel(original, { ...original, headers });
+    headers.Authorization = 'fixture-after';
+    await router.streamFn(prepared, emptyContext);
+    expect(stream.mock.calls[0][2]?.headers?.Authorization).toBe('fixture-before');
+  });
+
+  it('isolates concurrent request headers while credential resolution is pending', async () => {
+    const stream = vi.fn<StreamFn>(createAssistantMessageEventStream);
+    const pending = Promise.withResolvers<string>();
+    const router = new ModelRouter({ defaultAlias: 'local', streamFnOverride: stream, profiles: [
+      { ...profile, headers: { Authorization: 'fixture-first' }, apiKey: () => pending.promise },
+    ] });
+    const model = router.resolve().model;
+    const headers = { 'X-Request': 'first' };
+    const first = router.streamFn(model, emptyContext, { headers });
+    model.headers!.Authorization = 'fixture-second';
+    headers['X-Request'] = 'second';
+    const second = router.streamFn(model, emptyContext, { headers });
+    pending.resolve('fixture-key');
+    await Promise.all([first, second]);
+    expect(stream.mock.calls.map(([model, , opts]) =>
+      [model.headers?.Authorization, opts?.headers?.Authorization, opts?.headers?.['X-Request']])).toEqual([
+      ['fixture-first', 'fixture-first', 'first'], ['fixture-second', 'fixture-second', 'second'],
+    ]);
+  });
+
   it.each([
     [undefined, 'Bearer local-no-key'],
     ['Custom local token', 'Custom local token'],

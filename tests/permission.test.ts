@@ -12,9 +12,12 @@ let dataDir: string;
 let core: AgentRuntime | undefined;
 beforeEach(async () => { dataDir = await testDirectory(); });
 afterEach(async () => {
-  await core?.dispose();
-  core = undefined;
-  await rm(dataDir, { recursive: true, force: true });
+  try {
+    await core?.dispose();
+    core = undefined;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 it('matches complete glob patterns and applies the last matching rule across ordered rulesets', () => {
@@ -32,6 +35,15 @@ it('matches complete glob patterns and applies the last matching rule across ord
   expect(engine.evaluate('edit', '/Repo/x', [allow, deny])).toBe('deny');
   expect(engine.evaluate('read', 'x', [deny])).toBe('allow');
   expect(new PermissionEngine(undefined, 'ask').evaluate('read', 'x', [deny])).toBe('ask');
+});
+
+it('keeps a tool visible when only single-character resources are denied', () => {
+  const engine = new PermissionEngine();
+  const deny: PermissionRule = { action: 'edit', resource: '?', effect: 'deny' };
+  expect(engine.isToolGloballyDenied(tool('edit'), [[deny]])).toBe(false);
+  expect(engine.evaluate('edit', 'ab', [deny])).toBe('allow');
+  expect(engine.evaluate('edit', 'a', [deny])).toBe('deny');
+  expect(engine.isToolGloballyDenied(tool('edit'), [[{ ...deny, resource: '**' }]])).toBe(true);
 });
 
 it('hides a globally denied tool while retaining a tool with a narrower exception', async () => {

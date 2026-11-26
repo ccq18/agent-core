@@ -8,15 +8,35 @@ export interface ToolSnapshot {
 export class ToolRegistry {
   private readonly groups = new Map<symbol, CoreToolDefinition[]>();
   private readonly builtIns: CoreToolDefinition[];
+  private revision = 0;
 
   constructor(builtIns: readonly CoreToolDefinition[] = []) {
     this.builtIns = [...builtIns];
   }
 
+  get version(): number {
+    return this.revision;
+  }
+
+  definitionFingerprint(): string {
+    let fingerprint = '';
+    for (const group of [this.builtIns, ...this.groups.values()]) {
+      for (const tool of group) {
+        fingerprint += JSON.stringify([tool.name, tool.readOnly, tool.executionMode, tool.permissionAction]);
+      }
+    }
+    return fingerprint;
+  }
+
+  invalidate(): void {
+    this.revision++;
+  }
+
   register(tools: readonly CoreToolDefinition[]): () => void {
     const id = Symbol();
     this.groups.set(id, [...tools]);
-    return () => { this.groups.delete(id); };
+    this.invalidate();
+    return () => { if (this.groups.delete(id)) this.invalidate(); };
   }
 
   snapshot(include: (tool: CoreToolDefinition) => boolean = () => true): ToolSnapshot {
@@ -28,6 +48,7 @@ export class ToolRegistry {
   }
 
   clear(): void {
+    if (this.groups.size) this.invalidate();
     this.groups.clear();
   }
 }

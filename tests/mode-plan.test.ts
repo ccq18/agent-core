@@ -1,15 +1,36 @@
 import { rm } from 'node:fs/promises';
 import { getCurrentTools, type TranscriptContext } from '@earendil-works/pi-ai';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { JsonlTreeSessionStore, ModeController, type AgentCoreEvent, type AgentRuntime, type PlanItem } from '../src/index.js';
-import { call, reply, runtime, testDirectory, textResult, tool } from './harness-fixtures.js';
+import { DEFAULT_PROMPT_TEMPLATES, JsonlTreeSessionStore, ModeController, wrapSystemUpdate,
+  SessionBatchAppendError, type AgentCoreEvent, type AgentRuntime, type PlanItem } from '../src/index.js';
+import { call, legacyStorage, reply, runtime, testDirectory, textResult, tool } from './harness-fixtures.js';
 
 let dir: string;
 const cores: AgentRuntime[] = [];
 beforeEach(async () => { dir = await testDirectory(); });
 afterEach(async () => {
-  await Promise.all(cores.splice(0).map((core) => core.dispose()));
-  await rm(dir, { recursive: true, force: true });
+  try {
+    await Promise.all(cores.splice(0).map((core) => core.dispose()));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('distinguishes a Plan reminder from identical text submitted as the user task', async () => {
+  const task = wrapSystemUpdate(DEFAULT_PROMPT_TEMPLATES.planModeEnter);
+  const contexts: TranscriptContext[] = [];
+  const core = runtime(dir, (model, context) => {
+    contexts.push(context);
+    return reply(model, { type: 'text', text: 'ok' });
+  });
+  cores.push(core);
+  const session = await core.createSession({ mode: 'plan' });
+  await session.prompt(task);
+  const messages = contexts[0].messages.filter(({ role }) => role === 'user');
+  expect(messages).toHaveLength(2);
+  expect(messages[0]).toMatchObject({ content: task, systemUpdate: true });
+  expect(messages[1]).toMatchObject({ content: [{ type: 'text', text: task }] });
+  expect(messages[1]).not.toHaveProperty('systemUpdate');
 });
 
 it('uses Plan permission rules for each tool even when read and write share an action', async () => {
@@ -21,6 +42,9 @@ it('uses Plan permission rules for each tool even when read and write share an a
       .toEqual(['todowrite', 'todoread', 'load_skill', 'subagent', 'question', 'read']);
     switch (step++) {
       case 0:
+        expect(context.messages.at(-2)).toMatchObject({
+          role: 'user', content: expect.stringMatching(/<system-update>\s*Plan mode is active/),
+        });
         return reply(model, call('write'), call('read'), call('todowrite', { items }));
       case 1: {
         const results = context.messages.filter(({ role }) => role === 'toolResult');
@@ -57,6 +81,44 @@ it('uses Plan permission rules for each tool even when read and write share an a
   expect((await fresh.openSession(session.id)).getPlan()).toEqual(items);
 });
 
+it.each([{ depth: 1 }, { subagentProfile: 'explore' }])('opens a persisted helper marked %o without mode reminders', async (metadata) => {
+  const { id } = await new JsonlTreeSessionStore(dir).create({ id: 'host-helper', mode: 'plan', metadata });
+  const storage = new JsonlTreeSessionStore(dir);
+  const write = vi.fn(async () => textResult('modified'));
+  const contexts: TranscriptContext[] = [];
+  const core = runtime(dir, (model, context) => {
+    contexts.push(context);
+    return contexts.length === 1 ? reply(model, call('read'), call('write')) : reply(model, { type: 'text', text: 'ok' });
+  }, { sessionStorage: storage, tools: [tool('read', { readOnly: true }), tool('write', { execute: write })] });
+  cores.push(core);
+
+  const helper = await core.openSession(id);
+  expect(helper.mode).toBe('plan');
+  await expect(helper.prompt('Inspect')).resolves.toMatchObject({ state: 'completed' });
+  const tools = getCurrentTools(contexts[0].messages).map(({ name }) => name);
+  expect(tools).toContain('read');
+  expect(tools).not.toContain('write');
+  expect(contexts[1].messages.filter(({ role }) => role === 'toolResult')).toMatchObject([
+    { toolName: 'read', isError: false },
+    { toolName: 'write', isError: true },
+  ]);
+  expect(write).not.toHaveBeenCalled();
+
+  await helper.close();
+  const reopened = await core.openSession(id);
+  await expect(reopened.prompt('Resume inspection')).resolves.toMatchObject({ state: 'completed' });
+  const planLeaf = (await storage.getBranch(id)).at(-1)!;
+  await reopened.setMode('build');
+  await expect(reopened.prompt('Work')).resolves.toMatchObject({ state: 'completed' });
+  await reopened.branch(planLeaf.id);
+  expect(reopened.mode).toBe('plan');
+  await expect(reopened.prompt('Resume plan branch')).resolves.toMatchObject({ state: 'completed' });
+
+  for (const { messages } of contexts) {
+    expect(JSON.stringify(messages.filter(({ role }) => role === 'user'))).not.toMatch(/(?:Plan|Build) mode is active/);
+  }
+});
+
 it('inserts mode reminders before the latest user message while keeping the leading system message equal across switches and branches', async () => {
   const contexts: TranscriptContext[] = [];
   const storage = new JsonlTreeSessionStore(dir);
@@ -73,6 +135,7 @@ it('inserts mode reminders before the latest user message while keeping the lead
   const planLeaf = (await storage.getBranch(session.id)).at(-1)!;
   await session.setMode('build');
   await session.prompt('Execute');
+  const changedBuild = (await storage.getBranch(session.id)).at(-1)!;
   await session.branch(planLeaf.id);
   await session.prompt('Plan branch');
   await session.branch(leaf.id);
@@ -83,13 +146,27 @@ it('inserts mode reminders before the latest user message while keeping the lead
     { role: 'user', content: expect.stringMatching(/<system-update>.*plan/is) },
     { role: 'user', content: expect.stringMatching(/<system-update>.*build/is) },
     { role: 'user', content: expect.stringMatching(/<system-update>.*plan/is) },
-    { role: 'user', content: expect.stringMatching(/<system-update>.*build/is) },
+    { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
   ]);
   expect(contexts.every(({ messages }) => JSON.stringify(messages[0]) === JSON.stringify(contexts[0].messages[0]))).toBe(true);
   expect(new ModeController('plan').transformContext([])).toHaveLength(1);
   const controller = new ModeController('plan');
   const corrected = controller.transformContext([]);
   expect(controller.transformContext(corrected)).toEqual(corrected);
+
+  // Open on the initial Build branch, then switch directly to the marked Build branch.
+  await session.close();
+  const fromInitial = await core.openSession(session.id);
+  await fromInitial.branch(changedBuild.id);
+  await fromInitial.prompt('Resume');
+  const afterSwitch = contexts.at(-1)!.messages.at(-2);
+  await fromInitial.branch(changedBuild.id);
+  await fromInitial.close();
+  const reopened = await core.openSession(session.id);
+  await reopened.prompt('Resume');
+  const afterOpen = contexts.at(-1)!.messages.at(-2);
+  expect(afterOpen).toMatchObject({ role: 'user', content: expect.stringContaining('Build mode is active') });
+  expect(afterSwitch).toMatchObject({ role: afterOpen!.role, content: afterOpen!.content });
 });
 
 it('blocks a write from a stale Build snapshot and refreshes the next step tool list', async () => {
@@ -169,4 +246,64 @@ it('rebuilds the Build reminder after reopening a compacted transcript', async (
   expect(contexts[1].messages.at(-2)).toMatchObject({
     role: 'user', content: expect.stringMatching(/<system-update>.*build/is),
   });
+});
+
+it.each(['batch', 'legacy'] as const)('keeps todowrite, mode and checkpoint journal order with %s storage', async (kind) => {
+  const storage = new JsonlTreeSessionStore(dir);
+  const batch = vi.spyOn(storage, 'appendBatch');
+  const single = vi.spyOn(storage, 'append');
+  const items = [{ id: 'one', content: 'Inspect input', status: 'in_progress' }] satisfies PlanItem[];
+  let calls = 0;
+  const core = runtime(dir, (model, context) => {
+    if (context.messages.at(-1)?.role === 'toolResult' || calls++ > 0) return reply(model, { type: 'text', text: 'Complete' });
+    return reply(model, call('todowrite', { items }));
+  }, { sessionStorage: kind === 'batch' ? storage : legacyStorage(storage), defaultPermissionEffect: 'allow',
+    compaction: { keepRecentTokens: 4, reserveTokens: 0 } });
+  cores.push(core);
+  const session = await core.createSession();
+  await expect(session.prompt('Record the initial plan')).resolves.toMatchObject({ state: 'completed' });
+  const written = await new JsonlTreeSessionStore(dir).getBranch(session.id);
+  const planIndex = written.findIndex(({ type }) => type === 'plan');
+  expect(written[planIndex - 1]).toMatchObject({ type: 'message', message: {
+    role: 'assistant', content: [expect.objectContaining({ type: 'toolCall', name: 'todowrite' })],
+  } });
+  expect(written[planIndex + 1]).toMatchObject({ type: 'message', message: { role: 'toolResult' } });
+  expect(written.at(-1)).toMatchObject({ type: 'message', message: { role: 'assistant' } });
+  if (kind === 'batch') expect(batch).toHaveBeenCalled();
+  else {
+    expect(batch).not.toHaveBeenCalled();
+    expect(single.mock.calls.filter(([, entry]) => entry.type === 'message')).toHaveLength(planIndex + 2);
+  }
+  await session.setMode('plan');
+  await session.prompt('A recent request to retain');
+  await expect(session.compact()).resolves.toMatchObject({ status: 'compacted' });
+  const branch = await storage.getBranch(session.id);
+  expect(branch.findIndex(({ type }) => type === 'mode')).toBe(written.length);
+  expect(branch.at(-1)).toMatchObject({ type: 'compaction', parentId: branch.at(-2)?.id });
+  await session.branch(written.at(-1)!.id);
+  expect(session.mode).toBe('build');
+});
+
+it('retries only the unwritten suffix when a turn batch reports a committed prefix', async () => {
+  const storage = new JsonlTreeSessionStore(dir);
+  const appendBatch = storage.appendBatch.bind(storage);
+  const committedIds: string[] = [];
+  vi.spyOn(storage, 'appendBatch').mockImplementationOnce(async (id, entries) => {
+    expect(entries).toHaveLength(3);
+    committedIds.push(...(await appendBatch(id, entries.slice(0, 2))).map(({ id }) => id));
+    throw new SessionBatchAppendError(2, true, new Error('interrupted write'));
+  });
+  const core = runtime(dir, (model) => reply(model, { type: 'text', text: 'Done' }), {
+    sessionStorage: storage, compaction: { enabled: false },
+  });
+  cores.push(core);
+  const session = await core.createSession();
+  await expect(session.prompt('First input')).rejects.toMatchObject({ committedCount: 2 });
+  await expect(session.prompt('Second input')).resolves.toMatchObject({ state: 'completed' });
+  const branch = (await new JsonlTreeSessionStore(dir).getBranch(session.id))
+    .filter((entry) => entry.type === 'message');
+  expect(branch.slice(1, 3).map(({ id }) => id)).toEqual(committedIds);
+  const dialogue = branch.filter(({ message }) => message.role !== 'system');
+  expect(dialogue.map(({ message }) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
+  expect(dialogue[0]).toMatchObject({ message: { content: [{ type: 'text', text: 'First input' }] } });
 });

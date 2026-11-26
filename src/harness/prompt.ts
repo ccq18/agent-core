@@ -1,4 +1,6 @@
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { PromptTemplates } from '../types/config.js';
+import { isRuleUpdateMessage } from './rules.js';
 import type { SkillMetadata } from './skills.js';
 
 export const DEFAULT_PROMPT_TEMPLATES: PromptTemplates = {
@@ -48,6 +50,15 @@ export function wrapSystemUpdate(template: string): string {
   const content = template.trim();
   return content.startsWith('<system-update>') && content.endsWith('</system-update>')
     ? content : `<system-update>\n${content}\n</system-update>`;
+}
+
+export function createSystemUpdateMessage(template: string) {
+  return { role: 'user', content: wrapSystemUpdate(template), timestamp: Date.now(), systemUpdate: true } as const;
+}
+
+export function isSystemUpdateMessage(message: AgentMessage): boolean {
+  return message.role === 'user' &&
+    (('systemUpdate' in message && message.systemUpdate === true) || isRuleUpdateMessage(message));
 }
 
 export interface PromptOptionsForAssembly {

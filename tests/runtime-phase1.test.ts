@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { rm } from 'node:fs/promises';
 import type { StreamFn } from '@earendil-works/pi-agent-core';
 import {
   createAssistantMessageEventStream,
@@ -10,6 +9,7 @@ import {
   createAgentRuntime, JsonlTreeSessionStore,
   type AgentCoreEvent, type AgentRuntime, type AgentRuntimeConfig, type CoreToolDefinition,
 } from '../src/index.js';
+import { testDirectory } from './harness-fixtures.js';
 
 const profile = {
   alias: 'test', providerId: 'test', modelId: 'test-model', protocol: 'openai-completions' as const,
@@ -48,14 +48,16 @@ function runtime(streamFnOverride: StreamFn, options: Partial<AgentRuntimeConfig
 }
 
 beforeEach(async () => {
-  await mkdir('node_modules/.test-tmp', { recursive: true });
-  dataDir = await mkdtemp(join('node_modules/.test-tmp', 'runtime-'));
+  dataDir = await testDirectory();
   runtimes = [];
 });
 
 afterEach(async () => {
-  await Promise.all(runtimes.map((item) => item.dispose()));
-  await rm(dataDir, { recursive: true, force: true });
+  try {
+    await Promise.all(runtimes.map((item) => item.dispose()));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 describe('Phase 1 runtime', () => {
@@ -263,10 +265,27 @@ describe('Phase 1 runtime', () => {
     await session.prompt('Alternative branch');
     const [model, transcript] = stream.mock.calls.at(-1)!;
     expect(model.id).toBe('test-model');
-    expect(userTexts(transcript)).toEqual(['Root', expect.stringContaining('Build mode is active'), 'Alternative branch']);
+    expect(userTexts(transcript)).toEqual(['Root', 'Alternative branch']);
     expect(await storage.getBranch(session.id, formerLeaf.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'model', modelAlias: 'fast' }),
     ]));
+  });
+
+  it('retains the selected alias credentials when prepareRequest clones a shared gateway model', async () => {
+    const first = vi.fn(() => 'fixture-first');
+    const second = vi.fn(() => 'fixture-second');
+    const stream = vi.fn<StreamFn>((model) => reply(model, 'ok'));
+    const core = runtime(stream, {
+      models: { defaultAlias: 'first', profiles: [
+        { ...profile, alias: 'first', apiKey: first }, { ...profile, alias: 'second', apiKey: second },
+      ], streamFnOverride: stream },
+      hooks: { prepareRequest: ({ model }) => ({ model: { ...structuredClone(model), maxTokens: 42 } }) },
+    });
+    const session = await core.createSession();
+    await expect(session.prompt('Hello', { modelAlias: 'second' })).resolves.toMatchObject({ state: 'completed' });
+    expect(second).toHaveBeenCalledOnce();
+    expect(first).not.toHaveBeenCalled();
+    expect(stream.mock.calls[0][0].maxTokens).toBe(42);
   });
 
   it('applies runtime hooks to registered tools and requests for an already open session', async () => {

@@ -6,10 +6,16 @@ import { DEFAULT_PROMPT_TEMPLATES } from '../harness/prompt.js';
 import { isRuleUpdateMessage } from '../harness/rules.js';
 import type { ModelRouter } from '../model/router.js';
 import type { CompactionOptions, PromptTemplates } from '../types/config.js';
-import type { CompactionResult, SessionEntry, SessionStorageAdapter } from '../types/session.js';
+import type { CompactionResult, SessionCompactionWindow, SessionEntry, SessionStorageAdapter } from '../types/session.js';
 import { getCompactionIndex, getCompactionStart, projectBranchMessages } from './store.js';
 
 const SHRINK_RATIOS = [0.85, 0.70, 0.50, 0.35];
+const RATE_LIMIT = /rate[ _-]*limit|too many requests|throttl/i;
+const HTTP_429 = /(?:^\s*|\b(?:api|http(?:\/[\d.]+)?|(?:status|error)(?:[ _-]?code)?|code)["']?[\s:=(\[]+["']?)429\b/i;
+
+export function isRateLimitError(message: string): boolean {
+  return RATE_LIMIT.test(message) || HTTP_429.test(message);
+}
 
 const estimateText = (text: string) => Math.ceil(text.length / 4);
 
@@ -72,54 +78,88 @@ export function findCutPoint(entries: readonly SessionEntry[], keepRecentTokens:
   return undefined;
 }
 
-function clip(text: string, limit: number): string {
-  if (text.length <= limit) return text;
-  if (limit <= 0) return '';
-  if (limit === 1) return '…';
-  return text.slice(0, limit - 1) + '…';
+function clip(text: string, limit: number, force = false): string {
+  if (!force && Buffer.byteLength(text) <= limit) return text;
+  if (limit < 3) return '';
+  // UTF-8 byte length is monotonic across complete code points.
+  let low = 0;
+  let high = Math.min(text.length, limit - 3);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(text.slice(0, mid)) <= limit - 3) low = mid;
+    else high = mid - 1;
+  }
+  const previous = text.charCodeAt(low - 1);
+  const next = text.charCodeAt(low);
+  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) low--;
+  return text.slice(0, low) + '…';
 }
 
-function serializeMessage(message: AgentMessage, stage: number, older: boolean): string {
+function serializeMessage(message: AgentMessage, stage: number, older: boolean, budget: number): string {
   switch (message.role) {
     case 'user':
     case 'assistant':
     case 'toolResult': {
       if (message.role === 'toolResult' && stage >= 2 && older) return '[toolResult omitted]';
-      const content = typeof message.content === 'string' ? message.content : message.content.flatMap((block) => {
+      const prefix = message.role === 'toolResult' ? `toolResult (${message.toolName}): ` : `${message.role}: `;
+      const limit = budget - Buffer.byteLength(prefix);
+      if (limit <= 0) return clip(prefix, budget);
+      const toolLimit = stage >= 1 ? 800 : 2000;
+      const bodyLimit = message.role === 'toolResult' ? Math.min(limit, toolLimit + 3) : limit;
+      const content = message.content;
+      const singleText = typeof content === 'string' ? content
+        : content.length === 1 && content[0].type === 'text' ? content[0].text : undefined;
+      if (typeof content === 'string' || singleText !== undefined) {
+        const value = singleText ?? '';
+        if (!value && message.role !== 'toolResult') return '';
+        if (message.role === 'toolResult' && Buffer.byteLength(value) > toolLimit && limit >= toolLimit + 3) {
+          return prefix + clip(value, toolLimit + 3, true);
+        }
+        return prefix + clip(value, bodyLimit);
+      }
+      const parts: string[] = [];
+      let remaining = bodyLimit;
+      for (const block of content) {
+        let part: string;
         switch (block.type) {
-          case 'text': return [block.text];
-          case 'image': return ['[image]'];
+          case 'text': part = block.text; break;
+          case 'image': part = '[image]'; break;
           case 'toolCall': {
             const args = JSON.stringify(block.arguments);
-            return [`[tool call ${block.name} ${stage >= 2 ? clip(args, 300) : args}]`];
+            part = `[tool call ${block.name} ${clip(args, stage >= 2 ? 300 : remaining)}]`;
+            break;
           }
-          default: return [];
+          default: continue;
         }
-      }).join('\n');
-      if (message.role === 'toolResult') {
-        const limit = stage >= 1 ? 800 : 2000;
-        return `toolResult (${message.toolName}): ${content.length > limit ? content.slice(0, limit) + '…' : content}`;
+        if (remaining <= 0) break;
+        const kept = clip(part, remaining);
+        if (kept) parts.push(kept);
+        remaining -= Buffer.byteLength(kept) + 1;
+        if (kept !== part) break;
       }
-      return content ? `${message.role}: ${content}` : '';
+      const body = parts.join('\n');
+      return body || message.role === 'toolResult' ? prefix + body : '';
     }
     default:
       return '';
   }
 }
 
-/** Share the character budget across long lines and leave short lines intact. */
+function linesSize(lines: readonly string[]): number {
+  return lines.reduce((size, line) => size + Buffer.byteLength(line), Math.max(0, (lines.length - 1) * 2));
+}
+
+/** Share the remaining budget across priority lines, keeping shorter lines intact. */
 function fitLines(lines: string[], budget: number): string {
-  const joined = lines.join('\n\n');
-  if (joined.length <= budget) return joined;
+  if (linesSize(lines) <= budget) return lines.join('\n\n');
   let available = budget - 2 * (lines.length - 1);
-  if (available < lines.length) {
-    // Extremely small budgets may not even fit the separators. Keep the ends.
-    if (lines.length <= 2 || budget < 4) return clip(joined, budget);
+  if (available < lines.length * 3) {
+    if (lines.length <= 2 || budget < 8) return clip(lines[0] ?? '', budget);
     return fitLines([lines[0], lines.at(-1)!], budget);
   }
   let remaining = lines.length;
   let cap = available;
-  for (const length of lines.map((line) => line.length).sort((left, right) => left - right)) {
+  for (const length of lines.map((line) => Buffer.byteLength(line)).sort((left, right) => left - right)) {
     cap = Math.floor(available / remaining);
     if (length > cap) break;
     remaining--;
@@ -149,30 +189,62 @@ function summarySource(branch: readonly SessionEntry[], cut: number): SummarySou
 
 function summaryHistory(source: SummarySource, instructions: string | undefined, stage: number, budget: number): string {
   const { messages, previousSummary } = source;
-  let latest = messages.length - 1;
-  while (latest > 0 && (messages[latest].role !== 'user' || isRuleUpdateMessage(messages[latest]))) latest--;
-  let lastToolResult = messages.length - 1;
-  while (lastToolResult >= 0 && messages[lastToolResult].role !== 'toolResult') lastToolResult--;
-  const olderThan = Math.max(latest, lastToolResult);
-  const history = messages.map((message, index) => serializeMessage(message, stage, index < olderThan));
-  const head = previousSummary === undefined ? [] : [`Previous checkpoint:\n${previousSummary}`];
-  const tail = instructions ? [`Additional summary instructions:\n${instructions}`] : [];
-  if (stage < 3) return fitLines([...head, ...history.filter(Boolean), ...tail], budget);
-
-  const newest = history.slice(latest).filter(Boolean);
+  const isRequest = (message: AgentMessage) => message.role === 'user' && !isRuleUpdateMessage(message);
+  let latest = 0;
+  let lastTool = -1;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (lastTool < 0 && messages[index].role === 'toolResult') lastTool = index;
+    // If the cut falls immediately after a user message, also keep the preceding exchange.
+    if (index < messages.length - 1 && isRequest(messages[index])) {
+      latest = index;
+      break;
+    }
+  }
+  const olderThan = Math.max(latest, lastTool);
+  const serialize = (message: AgentMessage, index: number) => serializeMessage(message, stage, index < olderThan, budget);
+  const head = previousSummary === undefined ? [] : [`Previous checkpoint:\n${clip(previousSummary, budget)}`];
+  const tail = instructions ? [`Additional summary instructions:\n${clip(instructions, budget)}`] : [];
+  const newest = messages.slice(latest).map((message, index) => serialize(message, latest + index)).filter(Boolean);
   if (stage === 4) {
     const recent = newest.length > 4 ? [newest[0], ...newest.slice(-3)] : newest;
     return fitLines([...head, ...recent.map((line) => clip(line, 320)), ...tail], budget);
   }
 
-  let remaining = budget - [...head, ...newest, ...tail].join('\n\n').length;
-  const kept: string[] = [];
-  for (const line of history.slice(0, latest).filter(Boolean).reverse()) {
-    remaining -= line.length + 2;
-    if (remaining < 0) break;
-    kept.push(line);
+  const priority = [...head, ...newest, ...tail];
+  let remaining = budget - linesSize(priority);
+  if (remaining <= 0) return fitLines(priority, budget);
+  const older: string[] = [];
+  let exchange: string[] = [];
+  let exchangeSize = 0;
+  for (let index = latest - 1; index >= 0; index--) {
+    const line = serialize(messages[index], index);
+    if (line) {
+      exchangeSize += Buffer.byteLength(line) + 2;
+      if (stage === 0 && exchangeSize > remaining) break;
+      exchange.push(line);
+    }
+    if (index === 0 || isRequest(messages[index])) {
+      if (exchangeSize > remaining) {
+        if (remaining > 2) {
+          const reduced = fitLines(exchange.reverse(), remaining - 2);
+          if (reduced) older.push(reduced);
+        }
+        break;
+      }
+      for (const line of exchange) older.push(line);
+      remaining -= exchangeSize;
+      exchange = [];
+      exchangeSize = 0;
+    }
   }
-  return fitLines([...head, ...kept.reverse(), ...newest, ...tail], budget);
+  return [...head, ...older.reverse(), ...newest, ...tail].join('\n\n');
+}
+
+async function drainSummary(response: Awaited<ReturnType<ModelRouter['streamFn']>>) {
+  for await (const _event of response) {
+    // Consume intermediate events as they arrive. Only the final message is used.
+  }
+  return response.result();
 }
 
 export type CompactionTrigger = 'auto' | 'overflow' | 'manual';
@@ -253,16 +325,26 @@ export class CompactionEngine {
   }
 
   private async computeCandidate(sessionId: string, model: Model<Api>, signal: AbortSignal): Promise<PrecomputedSummary | undefined> {
-    const branch = await this.storage.getBranch(sessionId);
+    const { entries: branch, leafId } = await this.getWindow(sessionId);
     const cut = findCutPoint(branch, this.keepRecentTokens);
-    if (cut === undefined || signal.aborted) return undefined;
+    if (cut === undefined || leafId === null || signal.aborted) return undefined;
     const source = summarySource(branch, cut);
     const summaryModel = this.resolveModel(model);
     const result = await this.summarize(sessionId, summaryModel, source, signal);
     if (result.status !== 'summarized' || signal.aborted) return undefined;
     return {
-      leafId: branch.at(-1)!.id, previousId: source.previousId, firstKeptEntryId: source.firstKeptEntryId,
+      leafId, previousId: source.previousId, firstKeptEntryId: source.firstKeptEntryId,
       model: summaryModel, summary: result.summary,
+    };
+  }
+
+  private async getWindow(sessionId: string): Promise<SessionCompactionWindow> {
+    if (this.storage.getCompactionWindow) return this.storage.getCompactionWindow(sessionId);
+    const entries = await this.storage.getBranch(sessionId);
+    const first = entries[0];
+    return {
+      entries, leafId: entries.at(-1)?.id ?? null,
+      systemBaseline: first?.type === 'message' && first.message.role === 'system' ? first.message : undefined,
     };
   }
 
@@ -273,25 +355,32 @@ export class CompactionEngine {
   private async summarize(
     sessionId: string, model: Model<Api>, source: SummarySource, signal?: AbortSignal, instructions?: string,
   ): Promise<SummaryResult> {
-    const fullHistory = summaryHistory(source, instructions, 0, Infinity);
+    const system = this.prompts.compactionSummary;
+    const protocolReserve = Math.max(64, Math.min(512, Math.ceil(model.contextWindow * 0.05)));
+    const available = model.contextWindow - protocolReserve - Math.ceil(Buffer.byteLength(system) / 4);
+    if (available < 2) return { status: 'failed', error: 'Summary model context has no room for summary input and output' };
+    // Normally reserve the configured limit. Leave room for input on models whose output ceiling spans the context.
+    const maxTokens = model.maxTokens < available ? model.maxTokens : Math.floor(available / 2);
+    const budget = (available - maxTokens) * 4;
+    const fullHistory = summaryHistory(source, instructions, 0, budget);
     if (!fullHistory) return { status: 'skipped', reason: 'no-cut-point' };
     let content = fullHistory;
     for (let attempt = 0; ; attempt++) {
       if (signal?.aborted) return { status: 'skipped', reason: 'aborted' };
       try {
         const response = await this.router.streamFn(model, normalizeContext({
-          systemPrompt: this.prompts.compactionSummary,
+          systemPrompt: system,
           tools: [],
           messages: [{ role: 'user', content, timestamp: Date.now() }],
-        }), { signal, sessionId, toolChoice: 'none' });
-        const result = response.result();
+        }), { signal, sessionId, toolChoice: 'none', maxTokens });
+        const result = drainSummary(response);
         const message = await (signal ? raceWithAbortSignal(result, signal) : result);
         if (signal?.aborted || message.stopReason === 'aborted') return { status: 'skipped', reason: 'aborted' };
-        if (isContextOverflow(message, model.contextWindow)) {
+        if (!isRateLimitError(message.errorMessage ?? '') && isContextOverflow(message, model.contextWindow)) {
           if (attempt === SHRINK_RATIOS.length) {
             return { status: 'failed', error: message.errorMessage ?? 'Summary request exceeded the context window' };
           }
-          const budget = Math.max(0, Math.min(content.length - 1, Math.floor(fullHistory.length * SHRINK_RATIOS[attempt])));
+          const budget = Math.max(0, Math.min(Buffer.byteLength(content) - 1, Math.floor(Buffer.byteLength(fullHistory) * SHRINK_RATIOS[attempt])));
           content = summaryHistory(source, instructions, attempt + 1, budget);
           continue;
         }
@@ -309,16 +398,16 @@ export class CompactionEngine {
   async compact(input: CompactionInput): Promise<EngineResult> {
     const { sessionId, tokensBefore, trigger, signal } = input;
     if (signal?.aborted) return { status: 'skipped', reason: 'aborted' };
-    const branch = await this.storage.getBranch(sessionId);
+    const { entries: branch, leafId, systemBaseline } = await this.getWindow(sessionId);
     const candidate = trigger === 'auto' && !input.customInstructions ? this.candidates.get(sessionId)?.result : undefined;
     this.clearPrecompute(sessionId);
     if (signal?.aborted) return { status: 'skipped', reason: 'aborted' };
 
     const cut = findCutPoint(branch, this.keepRecentTokens) ??
       (trigger === 'overflow' ? findCutPoint(branch, 0) : undefined);
-    if (cut === undefined) return { status: 'skipped', reason: 'no-cut-point' };
+    if (cut === undefined || leafId === null) return { status: 'skipped', reason: 'no-cut-point' };
     const source = summarySource(branch, cut);
-    if (!source.messages.some((message) => serializeMessage(message, 0, false))) {
+    if (!source.messages.length) {
       return { status: 'skipped', reason: 'no-cut-point' };
     }
     input.onStart?.();
@@ -327,8 +416,8 @@ export class CompactionEngine {
       ({ type: 'compaction' as const, summary, firstKeptEntryId, tokensBefore });
     const estimateAfter = (entry: ReturnType<typeof entryFor>) => {
       const messages = projectBranchMessages([...branch, {
-        ...entry, id: '', parentId: branch.at(-1)!.id, timestamp: Date.now(),
-      }]).messages;
+        ...entry, id: '', parentId: leafId, timestamp: Date.now(),
+      }], systemBaseline ?? null).messages;
       const baseline = messages[0]?.role === 'system' ? undefined : createInitialSystemMessage(input.systemPrompt, undefined);
       return estimateContextTokens(messages, messages.length) + (baseline ? estimateMessageTokens(baseline) : 0);
     };
@@ -355,12 +444,22 @@ export class CompactionEngine {
       if (result.status !== 'summarized') return result;
       entry = entryFor(result.summary, source.firstKeptEntryId);
     }
-    if (signal?.aborted) return { status: 'skipped', reason: 'aborted' };
     const tokensAfter = estimateAfter(entry);
-    const saved = await this.storage.append(sessionId, { ...entry, tokensAfter });
+    if (signal?.aborted) return { status: 'skipped', reason: 'aborted' };
+    let saved: SessionEntry | undefined;
+    if (this.storage.appendCompaction) {
+      saved = await this.storage.appendCompaction(sessionId, leafId, { ...entry, tokensAfter }, signal);
+    } else {
+      const current = await this.getWindow(sessionId);
+      if (current.leafId === leafId && current.entries.some(({ id }) => id === entry.firstKeptEntryId) && !signal?.aborted) {
+        saved = await this.storage.append(sessionId, { ...entry, tokensAfter });
+      }
+    }
+    if (!saved) return signal?.aborted ? { status: 'skipped', reason: 'aborted' }
+      : { status: 'failed', error: 'Session branch changed during compaction' };
     return {
       status: 'compacted', summary: entry.summary, firstKeptEntryId: entry.firstKeptEntryId, tokensBefore, tokensAfter,
-      messages: projectBranchMessages([...branch, saved]).messages,
+      messages: projectBranchMessages([...branch, saved], systemBaseline ?? null).messages,
     };
   }
 }

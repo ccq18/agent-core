@@ -1,23 +1,27 @@
+import type { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type PrepareRequest } from '@earendil-works/pi-agent-core';
-import { createInitialSystemMessage, getCurrentTools, getToolStateChanges, toToolDeclaration, type Api, type Model } from '@earendil-works/pi-ai';
+import { createInitialSystemMessage, getCurrentTools, getToolStateChanges, toToolDeclaration, type Api, type AssistantMessage, type Model } from '@earendil-works/pi-ai';
+import { isContextOverflow } from '@earendil-works/pi-ai/utils/overflow';
 import { ModeController } from '../harness/mode.js';
 import { PermissionEngine, type PermissionRulesets } from '../harness/permission.js';
 import { PlanStore } from '../harness/plan.js';
-import { DEFAULT_PROMPT_TEMPLATES, wrapSystemUpdate } from '../harness/prompt.js';
+import { createSystemUpdateMessage, DEFAULT_PROMPT_TEMPLATES, wrapSystemUpdate } from '../harness/prompt.js';
 import type { QuestionManager } from '../harness/question.js';
 import { isRuleUpdateMessage, RulesLoader, type RuleUpdateMessage } from '../harness/rules.js';
 import type { SubagentManager, SubagentParent } from '../harness/subagent.js';
-import { ToolRegistry } from '../harness/tool-registry.js';
+import { ToolRegistry, type ToolSnapshot } from '../harness/tool-registry.js';
 import type { OutputTruncator } from '../harness/truncation.js';
 import type { ModelRouter } from '../model/router.js';
-import { CompactionEngine, estimateContextTokens, type CompactionTrigger } from '../session/compaction.js';
+import { CompactionEngine, estimateContextTokens, isRateLimitError, type CompactionTrigger } from '../session/compaction.js';
 import type { AgentRuntimeHooks, PromptOptions, PromptTemplates, SubagentProfile } from '../types/config.js';
 import type { AgentCoreEvent, AgentCoreEventData, TurnSummary } from '../types/events.js';
 import type { ApprovalDecision, ApprovalRequest, PendingApprovalRequest, PermissionRule } from '../types/permission.js';
 import type { PendingQuestionRequest, QuestionAnswer } from '../types/question.js';
+import { SessionBatchAppendError } from '../types/session.js';
 import type { AgentMode, CompactionResult, PlanItem, SessionProjection, SessionStorageAdapter } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
+import type { Semaphore } from './concurrency.js';
 import { EventMapper, sumTokenUsage } from './event-mapper.js';
 
 export interface AgentSessionHandle {
@@ -46,6 +50,8 @@ interface SessionHandleOptions {
   router: ModelRouter;
   getTools?(): CoreToolDefinition[];
   toolRegistry?: ToolRegistry;
+  toolSlots?: Semaphore;
+  initializeTools?(signal: AbortSignal): Promise<void>;
   permissionEngine?: PermissionEngine;
   globalPermissions?: readonly PermissionRule[];
   sessionPermissions?: readonly PermissionRule[];
@@ -55,10 +61,13 @@ interface SessionHandleOptions {
   subagents?: SubagentManager;
   subagentProfile?: SubagentProfile;
   depth?: number;
+  subagentAncestry?: Readonly<{ parentSessionId?: string; subagentProfile?: string; depth: number }>;
+  turnContext?: AsyncLocalStorage<ReadonlyMap<string, AbortController>>;
   cwd?: string;
   systemPrompt?: string;
   hooks?: AgentRuntimeHooks;
   prompts?: PromptTemplates;
+  suppressModePrompt?: boolean;
   questions?: QuestionManager;
   rulesLoader?: RulesLoader;
   baselineRulePaths?: ReadonlySet<string>;
@@ -75,11 +84,31 @@ interface ActiveRun {
   retryOverflow: boolean;
   overflowMessage?: AgentMessage;
   requestModel?: Model<Api>;
+  toolSnapshot?: { visible: CoreToolDefinition[]; tools: AgentTool[] };
+  toolPermissionVersions?: Map<string, number>;
+}
+
+interface CachedToolSnapshot {
+  registryVersion: number;
+  definitionFingerprint: string;
+  permissionVersion: number;
+  mode: AgentMode;
+  profileKey: string;
+  snapshot: ToolSnapshot;
 }
 
 type EventListener = (event: AgentCoreEvent) => void;
-const OVERFLOW = /context length|maximum context|too many tokens|context_length_exceeded|prompt is too long/i;
 const PATH_FIELDS = ['path', 'filePath', 'file_path', 'cwd', 'directory'] as const;
+
+function isRequestOverflow(message: AssistantMessage, contextWindow: number): boolean {
+  if (message.stopReason === 'error') {
+    const error = message.errorMessage?.trim() ?? '';
+    if (isRateLimitError(error)) return false;
+    // Older gateways may return just this diagnostic.
+    if (/^maximum context reached[.!]?$/i.test(error)) return true;
+  }
+  return isContextOverflow(message, contextWindow);
+}
 
 export class SessionHandle implements AgentSessionHandle {
   readonly id: string;
@@ -94,14 +123,18 @@ export class SessionHandle implements AgentSessionHandle {
   private readonly compaction: CompactionEngine;
   private readonly rulesLoader: RulesLoader;
   private readonly pendingRules: Array<{ path: string; rule: string }> = [];
+  private readonly deferredInputs = new Set<Promise<void>>();
   private loadedRulePaths = new Set<string>();
   private toolDefinitions: ReadonlyMap<string, CoreToolDefinition> = new Map();
+  private cachedTools?: CachedToolSnapshot;
   private modelAlias?: string;
   private savedMessageCount: number;
   private usageAnchorStart = 0;
   private active?: ActiveRun;
   private changes = Promise.resolve();
   private persistence = Promise.resolve();
+  private persistenceNeedsRetry = false;
+  private persistenceBlocked?: SessionBatchAppendError;
   private closed = false;
   private closing?: Promise<void>;
   private manualCompaction?: AbortController;
@@ -132,7 +165,8 @@ export class SessionHandle implements AgentSessionHandle {
       },
       transformContext: async (messages, signal) => {
         const withRules = this.transformRuleContext(messages);
-        const transformed = this.modeController.transformContext(await hooks?.transformContext?.(withRules, signal) ?? withRules);
+        const context = await hooks?.transformContext?.(withRules, signal) ?? withRules;
+        const transformed = options.suppressModePrompt ? context : this.modeController.transformContext(context);
         if (!this.active?.finalizing) return transformed;
         // Providers can replay historical tool declarations from system messages.
         const withoutTools = transformed.map((message) => {
@@ -141,10 +175,10 @@ export class SessionHandle implements AgentSessionHandle {
           return rest;
         });
         if (!prompts.maxStepsSummary.trim()) return withoutTools;
-        return [...withoutTools, { role: 'user', content: wrapSystemUpdate(prompts.maxStepsSummary), timestamp: Date.now() }];
+        return [...withoutTools, createSystemUpdateMessage(prompts.maxStepsSummary)];
       },
       prepareRequest: this.prepareRequest,
-      finishTurn: () => this.active?.finalizing ? { action: 'end' } : undefined,
+      finishTurn: () => this.active?.finalizing || this.active?.overflowMessage ? { action: 'end' } : undefined,
       prepareNextTurnWithContext: ({ context }) => ({
         context: { ...context, tools: this.refreshTools() },
       }),
@@ -154,6 +188,8 @@ export class SessionHandle implements AgentSessionHandle {
         const run = this.active!;
         const reason = this.toolBlockReason(tool, args);
         if (reason) return { block: true, reason };
+        const permissionVersion = options.toolSlots && tool !== options.questions?.tool && tool !== options.subagents?.tool
+          ? this.permissions.refreshVersion(this.permissionRules) : undefined;
         const result = await this.permissions.beforeToolCall({
           sessionId: this.id, runId: run.summary.runId, toolCallId: toolCall.id, tool, args,
           signal: signal ?? run.controller.signal,
@@ -167,19 +203,15 @@ export class SessionHandle implements AgentSessionHandle {
         if (result?.block) return result;
         const updatedReason = this.toolBlockReason(tool, args);
         if (updatedReason) return { block: true, reason: updatedReason };
+        if (permissionVersion !== undefined) (run.toolPermissionVersions ??= new Map()).set(toolCall.id, permissionVersion);
         return hooks?.beforeToolCall?.(context, signal);
       },
       afterToolCall: async (context, signal) => {
         if (options.cwd && context.args && typeof context.args === 'object' && !signal?.aborted) {
-          for (const field of PATH_FIELDS) {
-            const path = (context.args as Record<string, unknown>)[field];
-            if (typeof path !== 'string') continue;
-            try {
-              this.injectRulesForPath(path);
-            } catch {
-              // An unreadable path must not replace the result of a tool that already ran.
-            }
-          }
+          const paths = PATH_FIELDS.map((field) => (context.args as Record<string, unknown>)[field])
+            .filter((path) => typeof path === 'string');
+          const found = await this.rulesLoader.discoverForPathsAsync(paths, this.loadedRulePaths, options.cwd);
+          if (!signal?.aborted && !this.closed) this.queueRuleUpdates(found);
         }
         const host = await hooks?.afterToolCall?.(context, signal);
         // Keep structured answers intact, including long free-form replies.
@@ -189,7 +221,7 @@ export class SessionHandle implements AgentSessionHandle {
           content: host?.content ?? context.result.content ?? [],
           details: host?.details ?? context.result.details,
         };
-        const truncated = await options.truncator.truncate(this.id, context.toolCall.id, result);
+        const truncated = await options.truncator.truncate(this.id, context.toolCall.id, result, context.toolCall.name);
         if (truncated === result) return host;
         return { ...host, content: truncated.content, details: truncated.details, structuredContent: undefined };
       },
@@ -212,9 +244,13 @@ export class SessionHandle implements AgentSessionHandle {
       depth: this.options.depth ?? 0, modelAlias: this.modelAlias,
       readOnly: this.options.subagentProfile?.readOnly === true,
       permissions: this.options.sessionPermissions?.slice(),
-      followUp: (input) => this.followUp(input),
+      followUp: (input) => this.queueInput('followUp', input, (this.options.depth ?? 0) > 0),
       emit: (runId, event) => this.emitRunEvent(runId, event),
     };
+  }
+
+  get subagentAncestry() {
+    return this.options.subagentAncestry;
   }
 
   subscribe(listener: EventListener): () => void {
@@ -238,10 +274,18 @@ export class SessionHandle implements AgentSessionHandle {
 
   injectRulesForPath(targetPath: string): string[] {
     if (this.closed) return [];
-    const found = this.rulesLoader.discoverForPath(targetPath, this.loadedRulePaths, this.options.cwd);
-    for (const rule of found) this.loadedRulePaths.add(rule.path);
-    this.pendingRules.push(...found);
-    return found.map(({ path }) => path);
+    return this.queueRuleUpdates(this.rulesLoader.discoverForPath(targetPath, this.loadedRulePaths, this.options.cwd));
+  }
+
+  private queueRuleUpdates(found: Array<{ path: string; rule: string }>): string[] {
+    const paths: string[] = [];
+    for (const rule of found) {
+      if (this.loadedRulePaths.has(rule.path)) continue;
+      this.loadedRulePaths.add(rule.path);
+      this.pendingRules.push(rule);
+      paths.push(rule.path);
+    }
+    return paths;
   }
 
   private transformRuleContext(messages: AgentMessage[]): AgentMessage[] {
@@ -276,9 +320,14 @@ export class SessionHandle implements AgentSessionHandle {
 
     const summary: TurnSummary = { sessionId: this.id, runId: randomUUID(), state: 'completed', text: '' };
     const controller = new AbortController();
+    const turnContext = this.options.turnContext;
+    const execute = () => this.runPrompt(input, options, summary, controller.signal);
+    const promise = turnContext
+      ? turnContext.run(new Map(turnContext.getStore()).set(this.id, controller), execute)
+      : execute();
     const run: ActiveRun = {
       summary, controller, acceptingMessages: true, steps: 0, finalizing: false, retryOverflow: this.compaction.enabled,
-      promise: this.runPrompt(input, options, summary, controller.signal),
+      promise,
     };
     this.active = run;
     try {
@@ -292,10 +341,25 @@ export class SessionHandle implements AgentSessionHandle {
   private async runPrompt(
     input: string, options: PromptOptions, summary: TurnSummary, signal: AbortSignal,
   ): Promise<TurnSummary> {
+    let subagentLease: Awaited<ReturnType<SubagentManager['acquireTurnLease']>>;
     try {
       await this.changes;
       const alias = options.modelAlias ?? this.modelAlias;
       const route = this.options.router.resolve(alias);
+      if (!signal.aborted && this.options.initializeTools) {
+        try {
+          await this.options.initializeTools(signal);
+        } catch (error) {
+          if (!signal.aborted) throw error;
+        }
+      }
+      if (!signal.aborted && this.options.subagents) {
+        try {
+          subagentLease = await this.options.subagents.acquireTurnLease(this.id, this.options.depth ?? 0, signal);
+        } catch (error) {
+          if (!signal.aborted) throw error;
+        }
+      }
       if (signal.aborted) {
         summary.state = 'cancelled';
         this.emit(this.mapper.create(summary.runId, { type: 'turn_start', mode: this.mode, modelId: route.model.id }));
@@ -303,50 +367,61 @@ export class SessionHandle implements AgentSessionHandle {
         return summary;
       }
 
-      await this.persistMessages();
-      if (options.modelAlias !== undefined && options.modelAlias !== this.modelAlias) {
-        await this.options.storage.append(this.id, { type: 'model', modelAlias: options.modelAlias });
-        this.modelAlias = options.modelAlias;
-      }
+      const executeTurn = async (): Promise<TurnSummary> => {
+        await this.persistMessages();
+        if (options.modelAlias !== undefined && options.modelAlias !== this.modelAlias) {
+          await this.options.storage.append(this.id, { type: 'model', modelAlias: options.modelAlias });
+          this.modelAlias = options.modelAlias;
+        }
 
-      this.agent.state.model = route.model;
-      this.agent.state.thinkingLevel = options.thinkingLevel ?? route.thinkingLevel;
-      this.refreshTools();
-      await this.agent.prompt(input, options.images);
-      const run = this.active!;
-      while (!signal.aborted) {
-        if (run.overflowMessage) {
-          const failed = run.overflowMessage;
-          run.overflowMessage = undefined;
-          run.retryOverflow = false;
-          this.agent.state.messages.pop();
-          run.acceptingMessages = true;
-          let result: CompactionResult | undefined;
-          try {
-            result = await this.compactContext('overflow', run.requestModel ?? route.model, summary.runId, signal);
-          } finally {
-            if (result?.status !== 'compacted') this.agent.state.messages.push(failed);
+        this.agent.state.model = route.model;
+        this.agent.state.thinkingLevel = options.thinkingLevel ?? route.thinkingLevel;
+        this.refreshTools();
+        await this.agent.prompt(input, options.images);
+        const run = this.active!;
+        while (!signal.aborted) {
+          if (run.overflowMessage) {
+            const failed = run.overflowMessage;
+            run.overflowMessage = undefined;
+            run.retryOverflow = false;
+            // A provider can include tool calls even on a stop/length response. Keep their results paired.
+            const removeResponse = this.agent.state.messages.at(-1) === failed;
+            if (removeResponse) this.agent.state.messages.pop();
+            run.acceptingMessages = true;
+            let result: CompactionResult | undefined;
+            try {
+              result = await this.compactContext('overflow', run.requestModel ?? route.model, summary.runId, signal);
+            } finally {
+              if (removeResponse && result?.status !== 'compacted') this.agent.state.messages.push(failed);
+            }
+            if (signal.aborted) summary.state = 'cancelled';
+            if (result.status !== 'compacted' || signal.aborted) break;
+            summary.text = '';
+            this.refreshTools();
+            await this.agent.continue();
+            continue;
           }
-          if (signal.aborted) summary.state = 'cancelled';
-          if (result.status !== 'compacted' || signal.aborted) break;
-          summary.text = '';
+          if (summary.state !== 'completed' || run.finalizing || !this.agent.hasQueuedMessages()) break;
+          // A message can arrive between Pi's final queue poll and agent_end.
+          run.acceptingMessages = true;
           this.refreshTools();
           await this.agent.continue();
-          continue;
         }
-        if (summary.state !== 'completed' || run.finalizing || !this.agent.hasQueuedMessages()) break;
-        // A message can arrive between Pi's final queue poll and agent_end.
-        run.acceptingMessages = true;
-        this.refreshTools();
-        await this.agent.continue();
-      }
-      return summary;
+        return summary;
+      };
+      return subagentLease
+        ? await this.options.subagents!.runWithTurnLease(subagentLease, executeTurn)
+        : await executeTurn();
     } finally {
-      if (this.active) this.active.overflowMessage = undefined;
-      await this.persistMessages();
-      const model = this.active?.requestModel;
-      if (this.compaction.precomputeEnabled && model && !signal.aborted && summary.state === 'completed') {
-        this.compaction.maybePrecompute(this.id, model, estimateContextTokens(this.agent.state.messages, this.usageAnchorStart));
+      try {
+        if (this.active) this.active.overflowMessage = undefined;
+        await this.persistMessages();
+        const model = this.active?.requestModel;
+        if (this.compaction.precomputeEnabled && model && !signal.aborted && summary.state === 'completed') {
+          this.compaction.maybePrecompute(this.id, model, estimateContextTokens(this.agent.state.messages, this.usageAnchorStart));
+        }
+      } finally {
+        subagentLease?.release();
       }
     }
   }
@@ -359,31 +434,71 @@ export class SessionHandle implements AgentSessionHandle {
     return undefined;
   }
 
-  private refreshTools(): AgentTool[] {
+  private getToolSnapshot(): ToolSnapshot {
+    const { toolRegistry, getTools, subagentProfile: profile, depth = 0 } = this.options;
+    const registryVersion = toolRegistry?.version ?? 0;
+    const definitionFingerprint = toolRegistry?.definitionFingerprint() ?? '';
+    const permissionVersion = this.permissions.refreshVersion(this.permissionRules);
+    const mode = this.mode;
+    const profileKey = profile ? JSON.stringify([depth, profile.readOnly, profile.allowedTools, profile.deniedTools]) : String(depth);
+    const cached = this.cachedTools;
+    if (cached && cached.registryVersion === registryVersion && cached.definitionFingerprint === definitionFingerprint &&
+        cached.permissionVersion === permissionVersion &&
+        cached.mode === mode && cached.profileKey === profileKey) return cached.snapshot;
+
     const savedRules = this.permissions.savedRules;
-    const registry = this.options.toolRegistry ?? new ToolRegistry(this.options.getTools?.());
-    const { definitions, visible } = registry.snapshot((tool) =>
-      (this.options.subagents?.allowsTool(tool, this.options.depth ?? 0, this.options.subagentProfile) ?? true) &&
+    const registry = toolRegistry ?? new ToolRegistry(getTools?.());
+    const snapshot = registry.snapshot((tool) =>
+      (this.options.subagents?.allowsTool(tool, depth, profile) ?? true) &&
       !this.permissions.isToolGloballyDenied(tool, [...this.permissionRules, savedRules, this.modeController.rulesFor(tool)]));
+    // A direct SessionHandle caller may supply an unversioned dynamic getTools callback.
+    if (toolRegistry) this.cachedTools = { registryVersion, definitionFingerprint, permissionVersion, mode, profileKey, snapshot };
+    return snapshot;
+  }
+
+  private refreshTools(): AgentTool[] {
+    const { definitions, visible } = this.getToolSnapshot();
     this.toolDefinitions = definitions;
     const run = this.active!;
+    if (run.toolSnapshot?.visible === visible) {
+      this.agent.state.tools = run.toolSnapshot.tools;
+      return run.toolSnapshot.tools;
+    }
+    const { runId } = run.summary;
+    const defaultSignal = run.controller.signal;
+    const { toolSlots, questions, subagents } = this.options;
     const snapshot = visible.map((tool): AgentTool => ({
       name: tool.name,
       label: tool.label,
       description: tool.description,
       parameters: tool.parameters,
       executionMode: tool.executionMode,
-      execute: async (toolCallId, params, signal = run.controller.signal, onUpdate) => {
-        // Pi can prepare multiple calls before executing them. The mode can change in between.
-        const reason = this.toolBlockReason(tool, params);
-        if (reason) throw new Error(reason);
-        const result = await tool.execute(params as Record<string, unknown>, {
-          sessionId: this.id, runId: run.summary.runId, toolCallId, signal,
-          onUpdate: (partial) => onUpdate?.({ ...partial, details: partial.details }),
-        });
-        return { ...result, details: result.details };
+      execute: async (toolCallId, params, signal = defaultSignal, onUpdate) => {
+        const release = toolSlots && tool !== questions?.tool && tool !== subagents?.tool
+          ? await toolSlots.acquire(signal) : undefined;
+        try {
+          if (release) signal.throwIfAborted();
+          // Pi can prepare multiple calls before executing them. The mode can change in between.
+          const reason = this.toolBlockReason(tool, params);
+          if (reason) throw new Error(reason);
+          if (release) {
+            const denied = this.permissions.denialReason({
+              tool, args: params, rulesets: () => this.permissionRules, modeRules: () => this.modeController.rulesFor(tool),
+              defaultEffect: this.options.defaultPermissionEffect,
+            });
+            if (denied) throw new Error(denied);
+          }
+          const result = await tool.execute(params as Record<string, unknown>, {
+            sessionId: this.id, runId, toolCallId, signal,
+            onUpdate: (partial) => onUpdate?.({ ...partial, details: partial.details }),
+          });
+          return { ...result, details: result.details };
+        } finally {
+          release?.();
+        }
       },
     }));
+    run.toolSnapshot = { visible, tools: snapshot };
     this.agent.state.tools = snapshot;
     return snapshot;
   }
@@ -408,7 +523,8 @@ export class SessionHandle implements AgentSessionHandle {
         this.compaction.maybePrecompute(this.id, request.model, tokens);
       }
     }
-    const update = await this.options.hooks?.prepareRequest?.({ ...request, context }, signal);
+    let update = await this.options.hooks?.prepareRequest?.({ ...request, context }, signal);
+    if (update?.model) update = { ...update, model: this.options.router.prepareModel(request.model, update.model) };
     run.requestModel = update?.model ?? request.model;
     const maxSteps = this.options.subagentProfile?.maxSteps;
     run.finalizing = maxSteps !== undefined && ++run.steps >= maxSteps;
@@ -421,6 +537,11 @@ export class SessionHandle implements AgentSessionHandle {
     if (!run) return;
     if (event.type === 'agent_start' && run.controller.signal.aborted) this.agent.abort();
     if (event.type === 'agent_end') run.acceptingMessages = false;
+    // Detect the overflow before Pi decides whether to drain queued messages or start another tool turn.
+    if (event.type === 'message_end' && event.message.role === 'assistant' && run.retryOverflow && !signal.aborted) {
+      const contextWindow = (run.requestModel ?? this.agent.state.model).contextWindow;
+      if (isRequestOverflow(event.message, contextWindow)) run.overflowMessage = event.message;
+    }
     const mapped = this.mapper.map(event, {
       runId: run.summary.runId, mode: this.mode, modelId: this.agent.state.model.id, signal,
       getToolLabel: (name) => this.agent.state.tools.find((tool) => tool.name === name)?.label,
@@ -431,9 +552,6 @@ export class SessionHandle implements AgentSessionHandle {
       run.summary.usage = sumTokenUsage(run.summary.usage, mapped.usage);
       run.summary.error = mapped.error;
       if (message.role === 'assistant') {
-        if (run.retryOverflow && mapped.state === 'failed' && OVERFLOW.test(mapped.error ?? '')) {
-          run.overflowMessage = message;
-        }
         const text = message.content.flatMap((block) => block.type === 'text' ? [block.text] : []).join('');
         if (text || mapped.state === 'completed') run.summary.text = text;
       }
@@ -442,22 +560,41 @@ export class SessionHandle implements AgentSessionHandle {
   }
 
   private persistMessages(): Promise<void> {
-    const messages = this.agent.state.messages.slice();
+    const messages = this.agent.state.messages;
     const overflow = this.active?.overflowMessage;
-    if (overflow && overflow === messages.at(-1)) {
-      messages.pop();
-    }
+    const end = messages.length - Number(!!overflow && overflow === messages.at(-1));
+    const start = this.savedMessageCount;
+    const suffix = messages.slice(start, end);
     const write = this.persistence.then(async () => {
-      while (this.savedMessageCount < messages.length) {
-        await this.options.storage.append(this.id, { type: 'message', message: messages[this.savedMessageCount] });
-        this.savedMessageCount++;
+      if (this.persistenceBlocked) throw this.persistenceBlocked;
+      const { storage } = this.options;
+      try {
+        if (storage.appendBatch && end - this.savedMessageCount > 1) {
+          const entries = suffix.slice(this.savedMessageCount - start)
+            .map((message) => ({ type: 'message' as const, message }));
+          await storage.appendBatch(this.id, entries);
+          this.savedMessageCount = end;
+        } else {
+          while (this.savedMessageCount < end) {
+            await storage.append(this.id, { type: 'message', message: suffix[this.savedMessageCount - start] });
+            this.savedMessageCount++;
+          }
+        }
+        this.persistenceNeedsRetry = false;
+      } catch (error) {
+        this.persistenceNeedsRetry = true;
+        if (error instanceof SessionBatchAppendError) {
+          this.savedMessageCount += error.committedCount ?? 0;
+          if (!error.retrySafe) this.persistenceBlocked = error;
+        }
+        throw error;
       }
     });
     this.persistence = write.catch(() => undefined);
     return write;
   }
 
-  private queueInput(kind: 'steer' | 'followUp', input: string): void {
+  private queueInput(kind: 'steer' | 'followUp', input: string, afterTurn = false): void {
     if (this.closed) return;
     const run = this.active;
     if (!run) {
@@ -469,12 +606,16 @@ export class SessionHandle implements AgentSessionHandle {
       return;
     }
     if (run.controller.signal.aborted) return;
-    if (run.acceptingMessages) {
+    if (run.acceptingMessages && !afterTurn) {
       const message: AgentMessage = { role: 'user', content: input, timestamp: Date.now() };
       this.agent[kind](message);
     } else {
-      const enqueue = () => this.queueInput(kind, input);
-      void run.promise.then(enqueue, enqueue);
+      // Background results need a fresh turn when the current one can stop without draining its queue.
+      const enqueue = () => {
+        if (!run.controller.signal.aborted) this.queueInput(kind, input, afterTurn);
+      };
+      const pending = run.promise.then(enqueue, enqueue).finally(() => this.deferredInputs.delete(pending));
+      this.deferredInputs.add(pending);
     }
   }
 
@@ -525,7 +666,7 @@ export class SessionHandle implements AgentSessionHandle {
       await this.options.storage.branch(this.id, fromEntryId);
       const projection = await this.options.storage.projectActiveMessages(this.id);
       const from = this.mode;
-      this.modeController.setMode(projection.mode);
+      this.modeController.restore(projection.mode, projection.modeChanged);
       this.modelAlias = projection.modelAlias;
       this.planStore.restore(projection.plan);
       this.pendingRules.length = 0;
@@ -613,18 +754,41 @@ export class SessionHandle implements AgentSessionHandle {
     }
   }
 
+  get closeCompletion(): Promise<void> | undefined {
+    return this.closing;
+  }
+
+  assertCanWaitForClose(): void {
+    if (this.active && this.options.turnContext?.getStore()?.get(this.id) === this.active.controller) {
+      throw new Error(`Cannot open session "${this.id}" while it is closing from its own active turn`);
+    }
+  }
+
+  async waitForBackgroundWork(): Promise<void> {
+    const { subagents } = this.options;
+    while (!this.closed && (this.active || this.deferredInputs.size || subagents?.hasActive(this.id))) {
+      await Promise.allSettled([this.active?.promise, ...this.deferredInputs, subagents?.wait(this.id)]);
+    }
+  }
+
   close(): Promise<void> {
-    this.closing ??= this.closeInternal();
+    this.closed = true;
+    this.closing ??= Promise.resolve().then(() => this.closeInternal());
     return this.closing;
   }
 
   private async closeInternal(): Promise<void> {
-    this.closed = true;
-    this.abort();
-    const [run] = await Promise.allSettled([this.active?.promise, this.changes, this.options.subagents?.wait(this.id)]);
-    this.detach();
-    this.listeners.clear();
-    this.options.onClose?.();
-    if (run.status === 'rejected') throw run.reason;
+    try {
+      this.abort();
+      const [run] = await Promise.allSettled([this.active?.promise, this.changes, this.options.subagents?.wait(this.id)]);
+      if (this.persistenceNeedsRetry && this.savedMessageCount < this.agent.state.messages.length) {
+        await this.persistMessages();
+      }
+      if (run.status === 'rejected') throw run.reason;
+    } finally {
+      this.detach();
+      this.listeners.clear();
+      this.options.onClose?.();
+    }
   }
 }

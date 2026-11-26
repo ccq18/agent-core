@@ -60,6 +60,8 @@ export interface PermissionCheck {
   onApprovalResolved?(request: PendingApprovalRequest, decision: ApprovalDecision): void;
 }
 
+type ToolPolicyCheck = Pick<PermissionCheck, 'tool' | 'args' | 'rulesets' | 'modeRules' | 'defaultEffect'>;
+
 interface PendingApproval {
   check: PermissionCheck;
   request: PendingApprovalRequest;
@@ -74,6 +76,8 @@ const ABORTED = { block: true, reason: 'Operation aborted while waiting for perm
 export class PermissionEngine {
   private readonly path?: string;
   private saved: PermissionRule[] = [];
+  private revision = 0;
+  private readonly configuredRules = new WeakMap<readonly PermissionRule[], PermissionRule[]>();
   private writes = Promise.resolve();
   private readonly pending = new Map<string, PendingApproval>();
 
@@ -89,6 +93,22 @@ export class PermissionEngine {
 
   get savedRules(): readonly PermissionRule[] {
     return this.saved.map((rule) => ({ ...rule }));
+  }
+
+  get version(): number {
+    return this.revision;
+  }
+
+  refreshVersion(rulesets: PermissionRulesets): number {
+    // Configured rules have historically been mutable by the host.
+    for (const rules of rulesets) {
+      const previous = this.configuredRules.get(rules);
+      if (previous?.length === rules.length && rules.every(({ action, resource, effect }, index) =>
+        action === previous[index].action && resource === previous[index].resource && effect === previous[index].effect)) continue;
+      this.configuredRules.set(rules, rules.map((rule) => ({ ...rule })));
+      if (previous) this.revision++;
+    }
+    return this.version;
   }
 
   evaluate(action: string, resource: string, ...rulesets: PermissionRulesets): PermissionEffect {
@@ -110,7 +130,7 @@ export class PermissionEngine {
     const action = actionOf(tool);
     const rules = rulesets.flat().filter((rule) => matchWildcard(rule.action, action));
     let global = rules.length - 1;
-    while (global >= 0 && !matchesResource(action, rules[global].resource, '*')) global--;
+    while (global >= 0 && !/^\*+$/.test(rules[global].resource)) global--;
     if (rules[global]?.effect !== 'deny') return false;
 
     // A narrower exception exposes the tool so that its actual arguments can be checked.
@@ -126,7 +146,7 @@ export class PermissionEngine {
     return true;
   }
 
-  private classify(check: PermissionCheck, action: string, resources: string[]) {
+  private classify(check: ToolPolicyCheck, action: string, resources: string[]) {
     const rules = [...check.rulesets(), this.saved, check.modeRules?.() ?? []];
     const denied: string[] = [];
     const unresolved: string[] = [];
@@ -138,15 +158,24 @@ export class PermissionEngine {
     return { denied, unresolved };
   }
 
-  async beforeToolCall(check: PermissionCheck): Promise<BeforeToolCallResult | undefined> {
-    if (check.signal?.aborted) return ABORTED;
+  private assessTool(check: ToolPolicyCheck) {
     const action = actionOf(check.tool);
     const resolved = check.tool.resolveResources?.(check.args as Record<string, unknown>);
     const resources = resolved?.length ? [...new Set(resolved)] : ['*'];
     const { denied, unresolved } = this.classify(check, action, resources);
-    if (denied.length) {
-      return { block: true, reason: `Permission denied for "${check.tool.name}" (${action}) on ${denied.join(', ')}` };
-    }
+    const reason = denied.length
+      ? `Permission denied for "${check.tool.name}" (${action}) on ${denied.join(', ')}` : undefined;
+    return { action, resources, unresolved, reason };
+  }
+
+  denialReason(check: ToolPolicyCheck): string | undefined {
+    return this.assessTool(check).reason;
+  }
+
+  async beforeToolCall(check: PermissionCheck): Promise<BeforeToolCallResult | undefined> {
+    if (check.signal?.aborted) return ABORTED;
+    const { action, resources, unresolved, reason } = this.assessTool(check);
+    if (reason) return { block: true, reason };
     if (unresolved.length === 0) return undefined;
 
     const createdAt = Date.now();
@@ -223,6 +252,7 @@ export class PermissionEngine {
       }
     }
     this.saved = rules;
+    this.revision++;
     this.finish(pending, undefined, decision);
     for (const other of [...this.pending.values()]) {
       if (other.saving || other.request.sessionId !== request.sessionId) continue;

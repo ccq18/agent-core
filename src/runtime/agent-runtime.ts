@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolve } from 'node:path';
 import { McpBridge } from '../harness/mcp.js';
 import { PermissionEngine } from '../harness/permission.js';
@@ -12,9 +13,10 @@ import { OutputTruncator } from '../harness/truncation.js';
 import { ModelRouter } from '../model/router.js';
 import { CompactionEngine } from '../session/compaction.js';
 import { JsonlTreeSessionStore } from '../session/store.js';
-import type { AgentRuntimeConfig, CreateSessionOptions, ModelRouterConfig, PromptTemplates, RuntimeCatalog } from '../types/config.js';
+import type { AgentRuntimeConfig, CreateSessionOptions, McpOptions, ModelRouterConfig, PromptTemplates, RuntimeCatalog } from '../types/config.js';
 import type { SessionStorageAdapter, SessionSummary } from '../types/session.js';
 import type { CoreToolDefinition } from '../types/tool.js';
+import { Semaphore, waitWithSignal } from './concurrency.js';
 import { SessionHandle, type AgentSessionHandle } from './session-handle.js';
 
 export interface AgentRuntime {
@@ -32,7 +34,9 @@ export interface AgentRuntime {
 class Runtime implements AgentRuntime {
   private readonly storage: SessionStorageAdapter;
   private readonly router: ModelRouter;
+  private readonly turnContext = new AsyncLocalStorage<ReadonlyMap<string, AbortController>>();
   private readonly sessions = new Map<string, Promise<SessionHandle>>();
+  private readonly managedSessions = new Set<Promise<SessionHandle>>();
   private readonly creating = new Set<Promise<SessionHandle>>();
   private readonly deleting = new Map<string, Promise<void>>();
   private readonly registry: ToolRegistry;
@@ -47,9 +51,14 @@ class Runtime implements AgentRuntime {
   private readonly subagents: SubagentManager;
   private readonly questions?: QuestionManager;
   private readonly mcp: McpBridge;
+  private readonly mcpInitPolicy: NonNullable<McpOptions['initPolicy']>;
+  private readonly toolSlots?: Semaphore;
   private disposal?: Promise<void>;
 
   constructor(private readonly config: AgentRuntimeConfig) {
+    this.mcpInitPolicy = config.mcpOptions?.initPolicy ?? 'on-first-session';
+    const maxToolExecutions = config.concurrency?.maxToolExecutions;
+    if (maxToolExecutions !== undefined) this.toolSlots = new Semaphore(maxToolExecutions);
     this.prompts = resolvePromptTemplates(config.prompts, config.baseSystemPrompt);
     this.storage = config.sessionStorage ?? new JsonlTreeSessionStore(config.dataDir);
     this.router = new ModelRouter(config.models);
@@ -60,10 +69,11 @@ class Runtime implements AgentRuntime {
     this.truncator = new OutputTruncator(config.dataDir, config.truncation);
     this.compaction = new CompactionEngine(this.storage, this.router, config.compaction, this.prompts);
     this.subagents = new SubagentManager(this.storage, {
-      create: (options) => this.createSession(options),
-      open: (id) => this.openSession(id),
+      create: (options) => this.createHandle(options, true),
+      open: (id, validate) => this.openHandle(id, true, validate),
+      release: (handle, drainBackground) => this.releaseManagedSession(handle, drainBackground),
       getParent: async (id) => (await this.sessions.get(id))?.getSubagentParent(),
-    }, config.subagents, config.maxSubagentDepth, this.prompts.subagentDescription);
+    }, config.subagents, config.maxSubagentDepth, this.prompts.subagentDescription, config.concurrency);
     if (config.enableQuestionTool !== false) {
       this.questions = new QuestionManager(({ sessionId, runId }, event) => {
         void this.sessions.get(sessionId)?.then((session) => session.emitRunEvent(runId, event));
@@ -77,16 +87,21 @@ class Runtime implements AgentRuntime {
     const builtIns = [...todoTools, this.skills.createTool(), this.subagents.tool];
     if (this.questions) builtIns.push(this.questions.tool);
     this.registry = new ToolRegistry(builtIns);
-    this.mcp = new McpBridge(this.registry, config.mcpServers, config.mcpClientFactory);
+    this.mcp = new McpBridge(this.registry, config.mcpServers, config.mcpClientFactory, config.mcpOptions);
     this.registerTools(config.tools ?? []);
+    if (this.mcpInitPolicy === 'background') void this.mcp.initialize();
   }
 
-  async createSession(options: CreateSessionOptions = {}): Promise<AgentSessionHandle> {
+  createSession(options: CreateSessionOptions = {}): Promise<AgentSessionHandle> {
+    return this.createHandle(options, false);
+  }
+
+  private async createHandle(options: CreateSessionOptions, managed: boolean): Promise<SessionHandle> {
     this.assertOpen();
     this.router.resolve(options.modelAlias);
     const cwd = options.cwd ?? (typeof options.metadata?.cwd === 'string' ? options.metadata.cwd : undefined);
     const settings = cwd === undefined ? options : { ...options, cwd: resolve(cwd) };
-    const pending = this.storage.create(settings).then((header) => this.loadSession(header.id));
+    const pending = this.storage.create(settings).then((header) => this.loadSession(header.id, managed));
     this.creating.add(pending);
     try {
       return await pending;
@@ -95,49 +110,113 @@ class Runtime implements AgentRuntime {
     }
   }
 
-  async openSession(id: string): Promise<AgentSessionHandle> {
-    const deletion = this.deleting.get(id);
-    if (deletion) await deletion;
-    this.assertOpen();
-    return this.loadSession(id);
+  openSession(id: string): Promise<AgentSessionHandle> {
+    return this.openHandle(id, false);
   }
 
-  private loadSession(id: string): Promise<SessionHandle> {
+  private async openHandle(
+    id: string, managed: boolean, validate?: (metadata?: Record<string, unknown>) => void,
+  ): Promise<SessionHandle> {
+    while (true) {
+      const deletion = this.deleting.get(id);
+      if (deletion) {
+        const handle = await this.sessions.get(id)?.catch(() => undefined);
+        handle?.assertCanWaitForClose();
+        await deletion;
+      }
+      this.assertOpen();
+      const existing = this.sessions.get(id);
+      const pending = existing ?? this.loadSession(id, managed);
+      const handle = await pending;
+      const closing = handle.closeCompletion;
+      if (!closing) {
+        try {
+          validate?.(handle.subagentAncestry);
+        } catch (error) {
+          if (!existing && this.managedSessions.delete(pending)) await handle.close();
+          throw error;
+        }
+        if (!managed) this.managedSessions.delete(pending);
+        return handle;
+      }
+      handle.assertCanWaitForClose();
+      await closing.catch(() => undefined);
+    }
+  }
+
+  private async releaseManagedSession(handle: AgentSessionHandle, drainBackground: boolean): Promise<void> {
+    const pending = this.sessions.get(handle.id);
+    if (!pending || !this.managedSessions.has(pending)) return;
+    const session = await pending;
+    if (session !== handle) return;
+    if (drainBackground) await session.waitForBackgroundWork();
+    if (this.managedSessions.delete(pending)) await session.close();
+  }
+
+  private loadSession(id: string, managed: boolean): Promise<SessionHandle> {
     const existing = this.sessions.get(id);
     if (existing) return existing;
-    const pending = this.storage.open(id).then(async ({ header }) => {
-      await this.mcp.initialize();
+    let retained = false;
+    const forget = () => {
+      if (this.sessions.get(id) === pending) this.sessions.delete(id);
+      this.managedSessions.delete(pending);
+    };
+    const release = () => {
+      if (retained) this.storage.releaseSession?.(id);
+    };
+    const pending: Promise<SessionHandle> = Promise.resolve().then(() => {
+      if (this.storage.retainSession && this.storage.releaseSession) {
+        this.storage.retainSession(id);
+        retained = true;
+      }
+      return this.storage.open(id);
+    }).then(async ({ header }) => {
+      if (this.mcpInitPolicy === 'on-first-session') await this.ensureMcpReady();
       const cwd = header.cwd ?? (typeof header.metadata?.cwd === 'string' ? header.metadata.cwd : undefined);
-      const { rules, paths } = this.rules.loadWithPaths(cwd);
+      const { rules, paths } = await this.rules.loadWithPathsAsync(cwd);
       const projection = await this.storage.projectActiveMessages(id);
       const metadata = header.metadata;
-      const depth = typeof metadata?.depth === 'number' && typeof metadata.parentSessionId === 'string' ? metadata.depth : 0;
-      const subagentProfile = depth > 0 && typeof metadata?.subagentProfile === 'string'
-        ? this.subagents.getProfile(metadata.subagentProfile) : undefined;
+      const metadataDepth = typeof metadata?.depth === 'number' ? metadata.depth : 0;
+      const profileName = typeof metadata?.subagentProfile === 'string' ? metadata.subagentProfile : undefined;
+      const parentSessionId = typeof metadata?.parentSessionId === 'string' ? metadata.parentSessionId : undefined;
+      const depth = parentSessionId !== undefined ? metadataDepth : 0;
+      const subagentProfile = depth > 0 && profileName !== undefined ? this.subagents.getProfile(profileName) : undefined;
+      // Host-created helpers may have subagent metadata without managed ancestry.
+      const suppressModePrompt = metadataDepth > 0 || profileName !== undefined;
       const prompts = subagentProfile?.systemPrompt ? {
         ...this.prompts,
         basePersona: [this.config.prompts?.basePersona ?? this.config.baseSystemPrompt, subagentProfile.systemPrompt]
           .filter(Boolean).join('\n\n'),
       } : this.prompts;
-      const handle = new SessionHandle({
+      const handle: SessionHandle = new SessionHandle({
         id, storage: this.storage, router: this.router, toolRegistry: this.registry,
+        toolSlots: this.toolSlots,
+        initializeTools: this.mcpInitPolicy === 'on-first-prompt'
+          ? (signal) => this.ensureMcpReady(signal) : undefined,
         systemPrompt: this.prompt.assemble({
           prompts, rules, skills: this.skills.modelIndex(), cwd,
         }),
         hooks: this.config.hooks, permissionEngine: this.permissions,
         globalPermissions: this.config.permissions, sessionPermissions: header.permissions,
         defaultPermissionEffect: this.config.defaultPermissionEffect, truncator: this.truncator,
-        compaction: this.compaction, subagents: this.subagents, subagentProfile, depth, cwd,
-        prompts, questions: this.questions, rulesLoader: this.rules, baselineRulePaths: paths,
-        onClose: () => { if (this.sessions.get(id) === pending) this.sessions.delete(id); },
+        compaction: this.compaction, subagents: this.subagents, subagentProfile, depth, cwd, turnContext: this.turnContext,
+        subagentAncestry: { parentSessionId, subagentProfile: profileName, depth },
+        prompts, suppressModePrompt, questions: this.questions, rulesLoader: this.rules, baselineRulePaths: paths,
+        onClose: () => {
+          // Keep the closing handle discoverable until its close promise settles.
+          void handle.closeCompletion?.then(forget, forget);
+          release();
+        },
       }, projection);
       for (const rule of rules) this.loadedRules.add(rule);
       return handle;
+    }).catch((error) => {
+      forget();
+      release();
+      throw error;
     });
     this.sessions.set(id, pending);
-    void pending.catch(() => {
-      if (this.sessions.get(id) === pending) this.sessions.delete(id);
-    });
+    if (managed) this.managedSessions.add(pending);
     return pending;
   }
 
@@ -186,6 +265,16 @@ class Runtime implements AgentRuntime {
     return this.mcp.reload();
   }
 
+  private async ensureMcpReady(signal?: AbortSignal): Promise<void> {
+    let current = this.mcp.initialize();
+    while (true) {
+      await (signal ? waitWithSignal(current, signal) : current);
+      const latest = this.mcp.initialize();
+      if (latest === current) return;
+      current = latest;
+    }
+  }
+
   getCatalog(): RuntimeCatalog {
     return {
       models: this.router.listProfiles().map(({ alias, modelId, providerId, protocol }) =>
@@ -198,17 +287,19 @@ class Runtime implements AgentRuntime {
   }
 
   dispose(): Promise<void> {
-    this.disposal ??= this.closeSessions();
+    this.disposal ??= Promise.resolve().then(() => this.closeSessions());
     return this.disposal;
   }
 
   private async closeSessions(): Promise<void> {
+    this.mcp.cancelInitialization();
     await Promise.allSettled([...this.creating, ...this.deleting.values()]);
     const handles = await Promise.allSettled(this.sessions.values());
     const results = await Promise.allSettled(handles.flatMap((handle) =>
       handle.status === 'fulfilled' ? [handle.value.close()] : []));
     this.sessions.clear();
-    const cleanup = await Promise.allSettled([this.mcp.dispose(), this.permissions.flush()]);
+    this.managedSessions.clear();
+    const cleanup = await Promise.allSettled([this.mcp.dispose(), this.permissions.flush(), this.truncator.flushCleanup()]);
     this.registry.clear();
     for (const result of [...results, ...cleanup]) {
       if (result.status === 'rejected') throw result.reason;

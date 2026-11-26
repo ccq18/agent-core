@@ -1,13 +1,20 @@
-import { mkdir, mkdtemp } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdtemp, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { StreamFn } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type JsonObject, type Model } from '@earendil-works/pi-ai';
-import { createAgentRuntime, type AgentRuntimeConfig, type CoreToolDefinition } from '../src/index.js';
+import { createAgentRuntime, type AgentRuntimeConfig, type CoreToolDefinition, type SessionStorageAdapter } from '../src/index.js';
 
 export async function testDirectory() {
-  const parent = resolve('node_modules/.test-tmp');
-  await mkdir(parent, { recursive: true });
-  return mkdtemp(join(parent, 'phase2-'));
+  return mkdtemp(join(await realpath(tmpdir()), 'agent-core-test-'));
+}
+
+export function legacyStorage(store: SessionStorageAdapter): SessionStorageAdapter {
+  return {
+    create: store.create.bind(store), open: store.open.bind(store), list: store.list.bind(store),
+    delete: store.delete.bind(store), append: store.append.bind(store), branch: store.branch.bind(store),
+    getBranch: store.getBranch.bind(store), projectActiveMessages: store.projectActiveMessages.bind(store),
+  };
 }
 
 export function runtime(dataDir: string, streamFnOverride: StreamFn, config: Partial<AgentRuntimeConfig> = {}) {

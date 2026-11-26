@@ -1,9 +1,9 @@
 import { readdirSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import type { CoreToolDefinition } from '../types/tool.js';
-import { readTextPrefix } from './rules.js';
+import { readTextPrefix, readTextPrefixAsync } from './rules.js';
 
 export interface SkillMetadata {
   id: string;
@@ -17,6 +17,33 @@ interface Skill extends SkillMetadata {
 }
 
 const FRONTMATTER = /^\uFEFF?---[^\S\r\n]*\r?\n([\s\S]*?)^---[^\S\r\n]*(?:\r?\n|$)/m;
+const SKILL_PREFIX_BYTES = 64 * 1024;
+const SCAN_CONCURRENCY = 8;
+
+type Schedule = <T>(operation: () => Promise<T>) => Promise<T>;
+
+function boundedScan(): Schedule {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  return async (operation) => {
+    if (active >= SCAN_CONCURRENCY) await new Promise<void>((start) => waiting.push(start));
+    else active++;
+    try {
+      return await operation();
+    } finally {
+      const next = waiting.shift();
+      if (next) next();
+      else active--;
+    }
+  };
+}
+
+async function orderedResults<T>(pending: Promise<T>[]): Promise<T[]> {
+  return (await Promise.allSettled(pending)).map((result) => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  });
+}
 
 function skillPaths(directory: string, root = true): string[] {
   let entries;
@@ -34,6 +61,20 @@ function skillPaths(directory: string, root = true): string[] {
   });
 }
 
+async function skillPathsAsync(directory: string, schedule: Schedule, root = true): Promise<string[]> {
+  const entries = await schedule(() => readdir(directory, { withFileTypes: true })).catch((error) => {
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return [];
+    throw error;
+  });
+  const paths = await orderedResults(entries.sort((a, b) => a.name.localeCompare(b.name)).map(async (entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return skillPathsAsync(path, schedule, false);
+    return (entry.isFile() || entry.isSymbolicLink()) &&
+      (entry.name === 'SKILL.md' || (root && entry.name.endsWith('.md'))) ? [path] : [];
+  }));
+  return paths.flat();
+}
+
 function metadata({ id, name, description }: Skill): SkillMetadata {
   return { id, name, ...(description === undefined ? {} : { description }) };
 }
@@ -48,22 +89,37 @@ export class SkillsRegistry {
   constructor(directories: readonly string[] = []) {
     for (const directory of directories) {
       for (const path of skillPaths(resolve(directory))) {
-        const prefix = readTextPrefix(path, 64 * 1024);
-        if (prefix === undefined) continue;
-        const frontmatter = FRONTMATTER.exec(prefix);
-        const document = frontmatter?.index === 0 ? parseDocument(frontmatter[1]) : undefined;
-        const metadata = document?.errors.length ? undefined : document;
-        const configuredName = metadata?.get('name');
-        const description = metadata?.get('description');
-        const fallback = basename(path) === 'SKILL.md' ? basename(dirname(path)) : basename(path, '.md');
-        const name = typeof configuredName === 'string' && configuredName.trim() ? configuredName.trim() : fallback;
-        if (this.skills.has(name)) continue;
-        this.skills.set(name, {
-          id: name, name, description: typeof description === 'string' ? description.trim() : undefined,
-          disableModelInvocation: metadata?.get('disable-model-invocation') === true, path,
-        });
+        this.register(path, readTextPrefix(path, SKILL_PREFIX_BYTES));
       }
     }
+  }
+
+  static async loadAsync(directories: readonly string[] = []): Promise<SkillsRegistry> {
+    const registry = new SkillsRegistry();
+    const schedule = boundedScan();
+    const paths = (await orderedResults(directories.map((directory) => skillPathsAsync(resolve(directory), schedule)))).flat();
+    for (let start = 0; start < paths.length; start += SCAN_CONCURRENCY) {
+      const batch = paths.slice(start, start + SCAN_CONCURRENCY);
+      const prefixes = await orderedResults(batch.map((path) => readTextPrefixAsync(path, SKILL_PREFIX_BYTES)));
+      for (let i = 0; i < batch.length; i++) registry.register(batch[i], prefixes[i]);
+    }
+    return registry;
+  }
+
+  private register(path: string, prefix: string | undefined): void {
+    if (prefix === undefined) return;
+    const frontmatter = FRONTMATTER.exec(prefix);
+    const document = frontmatter?.index === 0 ? parseDocument(frontmatter[1]) : undefined;
+    const metadata = document?.errors.length ? undefined : document;
+    const configuredName = metadata?.get('name');
+    const description = metadata?.get('description');
+    const fallback = basename(path) === 'SKILL.md' ? basename(dirname(path)) : basename(path, '.md');
+    const name = typeof configuredName === 'string' && configuredName.trim() ? configuredName.trim() : fallback;
+    if (this.skills.has(name)) return;
+    this.skills.set(name, {
+      id: name, name, description: typeof description === 'string' ? description.trim() : undefined,
+      disableModelInvocation: metadata?.get('disable-model-invocation') === true, path,
+    });
   }
 
   list(): SkillMetadata[] {

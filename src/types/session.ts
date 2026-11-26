@@ -37,6 +37,28 @@ export type SessionEntry = SessionEntryData & {
   timestamp: number;
 };
 
+export type SessionEntryInput = SessionEntryData;
+export type SessionCompactionInput = Extract<SessionEntryInput, { type: 'compaction' }>;
+
+export interface SessionCompactionWindow {
+  entries: SessionEntry[];
+  leafId: string | null;
+  systemBaseline?: Extract<AgentMessage, { role: 'system' }>;
+}
+
+/** Describes how much of the input is already in the authoritative journal. */
+export class SessionBatchAppendError extends Error {
+  constructor(
+    readonly committedCount: number | undefined,
+    readonly retrySafe: boolean,
+    cause: unknown,
+  ) {
+    const prefix = committedCount === undefined ? 'committed prefix unknown' : `${committedCount} entries committed`;
+    super(`Session batch append failed (${prefix}): ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'SessionBatchAppendError';
+  }
+}
+
 export interface SessionSnapshot {
   header: SessionHeader;
   leafId: string | null;
@@ -68,12 +90,22 @@ export type CompactionResult =
   | { status: 'failed'; error: string };
 
 export interface SessionStorageAdapter {
+  /** Optional paired hooks for keeping an open handle's cached session resident. */
+  retainSession?(sessionId: string): void;
+  releaseSession?(sessionId: string): void;
   create(options?: import('./config.js').CreateSessionOptions): Promise<SessionHeader>;
   open(sessionId: string): Promise<SessionSnapshot>;
   list(): Promise<SessionSummary[]>;
   delete(sessionId: string): Promise<void>;
   append(sessionId: string, entry: SessionEntryData): Promise<SessionEntry>;
+  /** In input order. Adapters with partial commits report the prefix via SessionBatchAppendError. */
+  appendBatch?(sessionId: string, entries: SessionEntryInput[]): Promise<SessionEntry[]>;
   branch(sessionId: string, fromEntryId: string): Promise<void>;
   getBranch(sessionId: string, leafId?: string): Promise<SessionEntry[]>;
+  getCompactionWindow?(sessionId: string): Promise<SessionCompactionWindow>;
+  /** Atomically append while the expected leaf and retention ancestor are still active and the signal is live. */
+  appendCompaction?(
+    sessionId: string, expectedLeafId: string, entry: SessionCompactionInput, signal?: AbortSignal,
+  ): Promise<SessionEntry | undefined>;
   projectActiveMessages(sessionId: string): Promise<SessionProjection>;
 }

@@ -88,6 +88,26 @@ export interface McpServerConfig {
   url?: string;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  /** End-to-end startup deadline, overriding mcpOptions.connectTimeoutMs. */
+  connectTimeoutMs?: number;
+}
+
+export interface McpOptions {
+  /** Defaults to waiting for MCP on the first createSession or openSession. */
+  initPolicy?: 'on-first-session' | 'on-first-prompt' | 'background';
+  /** Default deadline per server for transport start, handshake and tool discovery. Defaults to 30,000 ms. */
+  connectTimeoutMs?: number;
+  /** Maximum concurrent MCP startup attempts. Omit for no limit. */
+  maxConcurrentConnects?: number;
+}
+
+export interface ConcurrencyOptions {
+  /** Runtime-wide delegated subagent limit. Recommended: 4. Omit for no limit. */
+  maxSubagentsPerRuntime?: number;
+  /** Delegated subagent limit per parent session. Recommended: 2. Omit for no limit. */
+  maxSubagentsPerParent?: number;
+  /** Runtime-wide ordinary tool execution limit. Recommended: 8. Omit for no limit. */
+  maxToolExecutions?: number;
 }
 
 export interface McpServerStatus {
@@ -98,9 +118,15 @@ export interface McpServerStatus {
   error?: string;
 }
 
-export interface TruncationOptions {
+export interface TruncationBudget {
   maxLines?: number;
   maxBytes?: number;
+  strategy?: 'head-tail' | 'head';
+}
+
+export interface TruncationOptions extends TruncationBudget {
+  perTool?: Record<string, TruncationBudget>;
+  cleanup?: { enabled?: boolean; maxAgeMs?: number; maxTotalBytes?: number };
 }
 
 export interface AgentRuntimeConfig {
@@ -121,6 +147,8 @@ export interface AgentRuntimeConfig {
   skillDirs?: string[];
   mcpServers?: Array<McpServerConfig | PiMcpServerConfig>;
   mcpClientFactory?: McpClientFactory;
+  mcpOptions?: McpOptions;
+  concurrency?: ConcurrencyOptions;
   subagents?: Record<string, Partial<SubagentProfile>>;
   maxSubagentDepth?: number;
   compaction?: CompactionOptions;

@@ -13,9 +13,12 @@ let dir: string;
 let core: AgentRuntime | undefined;
 beforeEach(async () => { dir = await testDirectory(); });
 afterEach(async () => {
-  await core?.dispose();
-  core = undefined;
-  await rm(dir, { recursive: true, force: true });
+  try {
+    await core?.dispose();
+    core = undefined;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 it('registers tools on demand, forwards args and abort signal, and reports connection state', async () => {
